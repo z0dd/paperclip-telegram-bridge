@@ -73,6 +73,12 @@ jobs:
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Output image digests
+      - name: Output image digest references
         run: |
-          echo "Docker build completed. Digests will be used in production image references."
+          echo "Base images used in Dockerfile:"
+          echo "  Builder: rust:1.100.0-slim-bookworm"
+          echo "  Runtime: gcr.io/distroless/cc-debian12:nonroot"
+          echo ""
+          echo "Pull latest images to get digest references:"
+          docker pull rust:1.100.0-slim-bookworm 2>&1 | grep -i digest || echo "Digest not shown in pull"
+          docker pull gcr.io/distroless/cc-debian12:nonroot 2>&1 | grep -i digest || echo "Digest not shown in pull"
