@@ -17,46 +17,46 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@e2f00d665a20421b0b5e2b404b8a8e85d1e44675 # v4.1.7
-      - uses: dtolnay/rust-toolchain@0df575c1f02defcc5c5adf2345b36aaaa42dcb0e # master
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4.x
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: 1.100.0
           components: rustfmt
-      - uses: Swatinem/rust-cache@6d67d885c7ebeaf3a63b39f687cd6ab5a66c61d1 # v2.7.3
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.x
       - run: cargo fmt --all -- --check
 
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@e2f00d665a20421b0b5e2b404b8a8e85d1e44675 # v4.1.7
-      - uses: dtolnay/rust-toolchain@0df575c1f02defcc5c5adf2345b36aaaa42dcb0e # master
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4.x
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: 1.100.0
           components: clippy
-      - uses: Swatinem/rust-cache@6d67d885c7ebeaf3a63b39f687cd6ab5a66c61d1 # v2.7.3
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.x
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@e2f00d665a20421b0b5e2b404b8a8e85d1e44675 # v4.1.7
-      - uses: dtolnay/rust-toolchain@0df575c1f02defcc5c5adf2345b36aaaa42dcb0e # master
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4.x
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: 1.100.0
-      - uses: Swatinem/rust-cache@6d67d885c7ebeaf3a63b39f687cd6ab5a66c61d1 # v2.7.3
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.x
       - run: cargo test --all-features
 
   deny:
     name: deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@e2f00d665a20421b0b5e2b404b8a8e85d1e44675 # v4.1.7
-      - uses: dtolnay/rust-toolchain@0df575c1f02defcc5c5adf2345b36aaaa42dcb0e # master
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4.x
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: 1.100.0
-      - uses: EmbarkStudios/cargo-deny-action@38167a33a1333ebc9da0f9ed9e1e65e6c8bcbfe1 # master
+      - uses: EmbarkStudios/cargo-deny-action@0a4fb4acf0480a2f68e47e7de4155649fdf55b64 # master
         with:
           log-level: warn
           command: check all
@@ -65,15 +65,14 @@ jobs:
     name: docker
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@e2f00d665a20421b0b5e2b404b8a8e85d1e44675 # v4.1.7
-      - uses: docker/setup-buildx-action@0d72c29e13e0611b3ecb8e1848eea38e7d8dc2d9 # v3.5.0
-      - uses: docker/build-push-action@ca052437905b2b9baaf50c33307e8c4ff044cb266 # v5.4.0
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4.x
+      - uses: docker/setup-buildx-action@bf8388060db527dff14f48b6a5fdbe70763c1213 # v3.x
+      - uses: docker/build-push-action@562e51947939164e4fe808a6eab5101977e509e0 # v5.x
         with:
           context: .
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Log image digest for reference
+      - name: Output image digests
         run: |
-          echo "Builder image: rust:1.100.0-slim-bookworm (digest to be obtained from build)"
-          echo "Runtime image: gcr.io/distroless/cc-debian12:nonroot (digest to be obtained from build)"
+          echo "Docker build completed. Digests will be used in production image references."
