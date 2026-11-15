@@ -1,10 +1,9 @@
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-unsound = "deny"
+version = 2
 yanked = "deny"
 
 [licenses]
+version = 2
 allow = [
     "MIT",
     "Apache-2.0",
@@ -16,16 +15,11 @@ allow = [
     "Zlib",
     "CDLA-Permissive-2.0",
 ]
-deny = [
-    "GPL",
-    "LGPL",
-    "AGPL",
-    "SSPL",
-]
-copyleft = "deny"
-allow-osi-fsf-free = true
-default = "allow"
+confidence-threshold = 0.8
+
+[bans]
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

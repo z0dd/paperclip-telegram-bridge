@@ -4,7 +4,14 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-    grouping-strategy: "auto"
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+      major:
+        update-types:
+          - "major"
     open-pull-requests-limit: 5
     target-branch: main
 
@@ -12,12 +19,26 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-    grouping-strategy: "auto"
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+      major:
+        update-types:
+          - "major"
     open-pull-requests-limit: 5
 
   - package-ecosystem: docker
     directory: "/"
     schedule:
       interval: weekly
-    grouping-strategy: "auto"
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+      major:
+        update-types:
+          - "major"
     open-pull-requests-limit: 5

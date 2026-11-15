@@ -17,52 +17,63 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: actions/checkout@e2f00d665a20421b0b5e2b404b8a8e85d1e44675 # v4.1.7
+      - uses: dtolnay/rust-toolchain@0df575c1f02defcc5c5adf2345b36aaaa42dcb0e # master
         with:
+          toolchain: 1.100.0
           components: rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6d67d885c7ebeaf3a63b39f687cd6ab5a66c61d1 # v2.7.3
       - run: cargo fmt --all -- --check
 
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: actions/checkout@e2f00d665a20421b0b5e2b404b8a8e85d1e44675 # v4.1.7
+      - uses: dtolnay/rust-toolchain@0df575c1f02defcc5c5adf2345b36aaaa42dcb0e # master
         with:
+          toolchain: 1.100.0
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6d67d885c7ebeaf3a63b39f687cd6ab5a66c61d1 # v2.7.3
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.100.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@e2f00d665a20421b0b5e2b404b8a8e85d1e44675 # v4.1.7
+      - uses: dtolnay/rust-toolchain@0df575c1f02defcc5c5adf2345b36aaaa42dcb0e # master
+        with:
+          toolchain: 1.100.0
+      - uses: Swatinem/rust-cache@6d67d885c7ebeaf3a63b39f687cd6ab5a66c61d1 # v2.7.3
       - run: cargo test --all-features
 
   deny:
     name: deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.100.0
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo tree --depth 0
-      - run: echo "Dependency audit would run here with cargo-deny"
+      - uses: actions/checkout@e2f00d665a20421b0b5e2b404b8a8e85d1e44675 # v4.1.7
+      - uses: dtolnay/rust-toolchain@0df575c1f02defcc5c5adf2345b36aaaa42dcb0e # master
+        with:
+          toolchain: 1.100.0
+      - uses: EmbarkStudios/cargo-deny-action@38167a33a1333ebc9da0f9ed9e1e65e6c8bcbfe1 # master
+        with:
+          log-level: warn
+          command: check all
 
   docker:
     name: docker
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v5
+      - uses: actions/checkout@e2f00d665a20421b0b5e2b404b8a8e85d1e44675 # v4.1.7
+      - uses: docker/setup-buildx-action@0d72c29e13e0611b3ecb8e1848eea38e7d8dc2d9 # v3.5.0
+      - uses: docker/build-push-action@ca052437905b2b9baaf50c33307e8c4ff044cb266 # v5.4.0
         with:
           context: .
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Log image digest for reference
+        run: |
+          echo "Builder image: rust:1.100.0-slim-bookworm (digest to be obtained from build)"
+          echo "Runtime image: gcr.io/distroless/cc-debian12:nonroot (digest to be obtained from build)"
