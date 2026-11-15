@@ -5,36 +5,25 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
 
-# Install dependencies for bundled features if needed
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    libc6-dev \
-    && rm -rf /var/lib/apt/lists/*
-
 RUN cargo build --release --locked
 
-# Runtime stage
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:3d37b176f531e3f51326b5891a6fcc0b0c87318928b09049185aff28dae5426e
+# Runtime stage - using simple alpine as placeholder
+FROM debian:bookworm-slim@sha256:d5c0218172bec78acdce7a55a3b2f78d49dfdac94d1c4bf48a8234cedc8a1ab4
 
 WORKDIR /app
 
+RUN useradd -m -u 65532 nonroot && \
+    mkdir -p /state && \
+    chown nonroot:nonroot /state
+
 # Copy binary from builder
 COPY --from=builder /app/target/release/bridge /usr/local/bin/bridge
-
-# Create state directory
-RUN mkdir -p /state && chmod 777 /state
+RUN chmod +x /usr/local/bin/bridge
 
 VOLUME ["/state"]
-
-# Non-root user is already 65532:65532 in distroless
-USER 65532:65532
+USER nonroot:nonroot
 
 ENTRYPOINT ["/usr/local/bin/bridge"]
 CMD ["run"]
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/bridge", "healthcheck"] || exit 1
-
-# Signal handling
 STOPSIGNAL SIGTERM
