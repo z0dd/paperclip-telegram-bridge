@@ -1,0 +1,36 @@
+# Rust
+/target/
+Cargo.lock
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+*.p12
+*.pkcs12
+
+# Database & State
+*.db
+*.sqlite
+*.sqlite3
+
+# Artifacts
+*.o
+*.so
+*.a
+*.dylib
+
+# Logs
+*.log
+logs/
