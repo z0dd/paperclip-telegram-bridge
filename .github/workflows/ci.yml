@@ -56,7 +56,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: 1.100.0
-      - uses: EmbarkStudios/cargo-deny-action@0a4fb4acf0480a2f68e47e7de4155649fdf55b64 # master
+      - uses: EmbarkStudios/cargo-deny-action@c3bbe7e4e3f7baeee1a3dd9aec0a3b2aded580fb # v2.1.1
         with:
           log-level: warn
           command: check all

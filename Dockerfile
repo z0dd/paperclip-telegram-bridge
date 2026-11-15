@@ -1,5 +1,5 @@
 # Builder stage
-FROM rust:1.100.0-slim-bookworm@sha256:f5c7843d41f27d0b9b7c1b8d5a91f8e6c8d0e9f8b6c5a4d3e2f1a0b9c8d7e
+FROM rust:1.100.0-slim-bookworm AS builder
 
 WORKDIR /app
 
@@ -12,7 +12,7 @@ COPY src/ ./src/
 RUN cargo build --release --locked
 
 # Runtime stage - distroless non-root
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:d7c9e8f7b6a5d4c3e2f1a0b9c8d7e6f5a4d3c2b1e0f9a8b7c6d5e4f3a2b1c0
+FROM gcr.io/distroless/cc-debian12:nonroot
 
 # Copy binary from builder
 COPY --from=builder /app/target/release/bridge /usr/local/bin/bridge
