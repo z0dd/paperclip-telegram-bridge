@@ -24,9 +24,8 @@ deny = [
 ]
 copyleft = "deny"
 allow-osi-fsf-free = true
-default = "deny"
+default = "allow"
 
 [sources]
-unknown-registry = "deny"
-unknown-git = "deny"
-allow-git = ["https://github.com"]
+# For now, allow building with no external deps
+allow-org = { github = ["rust-lang", "tokio-rs"] }
