@@ -1,0 +1,22 @@
+[package]
+name = "paperclip-telegram-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.100"
+description = "Bridge service connecting Paperclip to Telegram"
+repository = "https://github.com/z0dd/paperclip-telegram-bridge"
+
+[[bin]]
+name = "bridge"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0

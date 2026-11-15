@@ -1,0 +1,32 @@
+[advisories]
+vulnerability = "deny"
+unmaintained = "warn"
+unsound = "deny"
+yanked = "deny"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]
+deny = [
+    "GPL",
+    "LGPL",
+    "AGPL",
+    "SSPL",
+]
+copyleft = "deny"
+allow-osi-fsf-free = true
+default = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com"]
