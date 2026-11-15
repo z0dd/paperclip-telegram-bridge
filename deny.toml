@@ -27,5 +27,5 @@ allow-osi-fsf-free = true
 default = "allow"
 
 [sources]
-# For now, allow building with no external deps
-allow-org = { github = ["rust-lang", "tokio-rs"] }
+unknown-registry = "deny"
+unknown-git = "deny"
