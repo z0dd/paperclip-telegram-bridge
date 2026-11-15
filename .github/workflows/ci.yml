@@ -17,43 +17,43 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4.x
-      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4.2.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master (stable)
         with:
           toolchain: 1.100.0
           components: rustfmt
-      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.x
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.7.3
       - run: cargo fmt --all -- --check
 
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4.x
-      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4.2.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master (stable)
         with:
           toolchain: 1.100.0
           components: clippy
-      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.x
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.7.3
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4.x
-      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4.2.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master (stable)
         with:
           toolchain: 1.100.0
-      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.x
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.7.3
       - run: cargo test --all-features
 
   deny:
     name: deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4.x
-      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4.2.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master (stable)
         with:
           toolchain: 1.100.0
       - uses: EmbarkStudios/cargo-deny-action@c3bbe7e4e3f7baeee1a3dd9aec0a3b2aded580fb # v2.1.1
@@ -65,27 +65,11 @@ jobs:
     name: docker
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4.x
-      - uses: docker/setup-buildx-action@bf8388060db527dff14f48b6a5fdbe70763c1213 # v3.x
-      - uses: docker/build-push-action@562e51947939164e4fe808a6eab5101977e509e0 # v5.x
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4.2.0
+      - uses: docker/setup-buildx-action@bf8388060db527dff14f48b6a5fdbe70763c1213 # v3.1.0
+      - uses: docker/build-push-action@562e51947939164e4fe808a6eab5101977e509e0 # v5.2.0
         with:
           context: .
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Fetch image digests
-        run: |
-          echo "Fetching digest for rust:1.100.0-slim-bookworm..."
-          docker pull rust:1.100.0-slim-bookworm 2>&1 | tee /tmp/rust_pull.log
-          RUST_DIGEST=$(grep -oP 'Digest: \K.*' /tmp/rust_pull.log || docker inspect rust:1.100.0-slim-bookworm --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
-          echo "RUST_DIGEST=${RUST_DIGEST}"
-
-          echo "Fetching digest for gcr.io/distroless/cc-debian12:nonroot..."
-          docker pull gcr.io/distroless/cc-debian12:nonroot 2>&1 | tee /tmp/distroless_pull.log
-          DISTROLESS_DIGEST=$(grep -oP 'Digest: \K.*' /tmp/distroless_pull.log || docker inspect gcr.io/distroless/cc-debian12:nonroot --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
-          echo "DISTROLESS_DIGEST=${DISTROLESS_DIGEST}"
-
-          echo ""
-          echo "=== Copy these to Dockerfile FROM statements ==="
-          echo "rust:1.100.0-slim-bookworm@${RUST_DIGEST}"
-          echo "gcr.io/distroless/cc-debian12:nonroot@${DISTROLESS_DIGEST}"
