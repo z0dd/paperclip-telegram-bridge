@@ -73,12 +73,19 @@ jobs:
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Output image digest references
+      - name: Fetch image digests
         run: |
-          echo "Base images used in Dockerfile:"
-          echo "  Builder: rust:1.100.0-slim-bookworm"
-          echo "  Runtime: gcr.io/distroless/cc-debian12:nonroot"
+          echo "Fetching digest for rust:1.100.0-slim-bookworm..."
+          docker pull rust:1.100.0-slim-bookworm 2>&1 | tee /tmp/rust_pull.log
+          RUST_DIGEST=$(grep -oP 'Digest: \K.*' /tmp/rust_pull.log || docker inspect rust:1.100.0-slim-bookworm --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
+          echo "RUST_DIGEST=${RUST_DIGEST}"
+
+          echo "Fetching digest for gcr.io/distroless/cc-debian12:nonroot..."
+          docker pull gcr.io/distroless/cc-debian12:nonroot 2>&1 | tee /tmp/distroless_pull.log
+          DISTROLESS_DIGEST=$(grep -oP 'Digest: \K.*' /tmp/distroless_pull.log || docker inspect gcr.io/distroless/cc-debian12:nonroot --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
+          echo "DISTROLESS_DIGEST=${DISTROLESS_DIGEST}"
+
           echo ""
-          echo "Pull latest images to get digest references:"
-          docker pull rust:1.100.0-slim-bookworm 2>&1 | grep -i digest || echo "Digest not shown in pull"
-          docker pull gcr.io/distroless/cc-debian12:nonroot 2>&1 | grep -i digest || echo "Digest not shown in pull"
+          echo "=== Copy these to Dockerfile FROM statements ==="
+          echo "rust:1.100.0-slim-bookworm@${RUST_DIGEST}"
+          echo "gcr.io/distroless/cc-debian12:nonroot@${DISTROLESS_DIGEST}"

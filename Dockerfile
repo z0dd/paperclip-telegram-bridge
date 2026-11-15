@@ -26,4 +26,4 @@ ENTRYPOINT ["/usr/local/bin/bridge"]
 CMD ["run"]
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/bridge", "health"] || exit 1
+    CMD ["/usr/local/bin/bridge", "health"]
