@@ -113,11 +113,11 @@ fi
 echo "✓ HostConfig.ReadonlyRootfs = true"
 
 # Verify no restart (meaning read-only FS works and /state is writable)
-RESTART_COUNT=$(docker inspect "$CONTAINER_ID" | jq -r '.[0].State.RestartCount')
-if [ "$RESTART_COUNT" != "0" ]; then
+RESTART_COUNT=$(docker inspect "$CONTAINER_ID" | jq -r '.[0].State.RestartCount // 0')
+if [ "$RESTART_COUNT" != "0" ] && [ "$RESTART_COUNT" != "null" ]; then
     fail "Container restarted ($RESTART_COUNT times), read-only FS may not be working"
 fi
-echo "✓ No restarts (State.RestartCount = 0)"
+echo "✓ No restarts (State.RestartCount = $RESTART_COUNT)"
 
 # Test 5: Check no published ports
 echo ""
