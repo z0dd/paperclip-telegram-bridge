@@ -26,7 +26,7 @@ echo "$EXTRAS_SHA256  $tmp/extras.tgz" | sha256sum -c -
 mkdir -p "$HOME/bin"
 tar -xzf "$tmp/docker.tgz" -C "$tmp"
 tar -xzf "$tmp/extras.tgz" -C "$tmp"
-cp -f "$tmp"/docker/* "$HOME/bin/"
+cp -f "$tmp"/docker/* "$tmp"/docker-rootless-extras/* "$HOME/bin/"
 export PATH="$HOME/bin:$PATH"
 
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"

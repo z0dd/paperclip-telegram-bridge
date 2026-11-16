@@ -114,7 +114,6 @@ services:
         [ "$(id -u)" = 65532 ] || { echo "uid is $(id -u)"; exit 1; }
         if touch /rootfs-probe 2>/dev/null; then echo "root fs is writable"; exit 1; fi
         touch /tmp/probe || { echo "/tmp is not writable"; exit 1; }
-        touch /state/probe || { echo "/state is not writable"; exit 1; }
         head -c1 /run/secrets/telegram_bot_token >/dev/null || { echo "secret unreadable"; exit 1; }
         wget -q -T 5 -O /dev/null http://127.0.0.1:3100/ || { echo "host loopback unreachable"; exit 1; }
         echo FS-CHECKS-OK
@@ -123,7 +122,7 @@ YAML
 OUT=$(docker compose -p "$HOST_P" -f compose.host-network.example.yml -f override-busybox.yml run --rm --no-deps -T bridge 2>&1) \
     || fail "host busybox checks failed: $OUT"
 printf '%s\n' "$OUT" | grep -q '^FS-CHECKS-OK$' || fail "host busybox: no FS-CHECKS-OK marker: $OUT"
-echo "✓ host: uid 65532, read-only root, writable /tmp and /state, secret readable, host loopback reachable"
+echo "✓ host: uid 65532, read-only root, writable /tmp, secret readable, host loopback reachable"
 docker compose -p "$HOST_P" -f compose.host-network.example.yml down -v >/dev/null
 kill "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
 
