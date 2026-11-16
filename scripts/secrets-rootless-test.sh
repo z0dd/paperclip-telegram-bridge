@@ -41,16 +41,17 @@ echo "✓ UID mapping: container 65532 -> host $ACTUAL_UID (subuid_start $SUBUID
 # --- 2. Hardened compose service reading /run/secrets/telegram_bot_token ----
 cp "$REPO_ROOT/deploy/compose.host-network.example.yml" "$WORK/compose.yml"
 : > "$WORK/.env"
-cat > "$WORK/override.yml" <<YAML
+# Quoted heredoc: `$$` is the compose escape for a literal `$` in the script.
+cat > "$WORK/override.yml" <<'YAML'
 services:
   bridge:
-    image: $BUSYBOX
+    image: busybox:1.37
     entrypoint:
       - sh
       - -c
       - |
         if head -c1 /run/secrets/telegram_bot_token >/dev/null 2>&1; then r=readable; else r=denied; fi
-        echo "RESULT=\$r uid=\$(id -u)"
+        echo "RESULT=$$r uid=$$(id -u)"
       - sh
 YAML
 mkdir -p "$WORK/secrets"
