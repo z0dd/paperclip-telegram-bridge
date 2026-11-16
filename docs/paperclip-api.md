@@ -62,7 +62,16 @@ Bridge **не** вызывает: создание/изменение задач
 ```json
 {"status":"ok","version":"2026.1106.0","deploymentMode":"authenticated","deploymentExposure":"private"}
 ```
-Bridge при старте логирует `version` и предупреждает, если она не из проверенного диапазона.
+Bridge при старте сравнивает `version` с проверенной версией по **точному совпадению**, а не с «диапазоном». Проверенная версия задана одной константой `TESTED_PAPERCLIP_VERSION` в `src/paperclip/version.rs` (в этом документе её значение отдельно не фиксируется; пример ответа выше показывает версию, на которой снимался контракт). Поведение (`version::classify`, `version::log_check`):
+
+| Значение `version` | Запись в логе |
+|---|---|
+| равна проверенной (после `trim`) | INFO `paperclip reachable`, `version_status="tested"` |
+| формат `YYYY.MMDD.N` (три части из ASCII-цифр, длины 4, 4 и ≥ 1), но другая | WARN `paperclip version differs from the tested one`, поля `paperclip_version` и `tested_version` |
+| поля нет, `null` или пустая строка | WARN `paperclip version is missing` |
+| любая другая строка (`latest`, `v2026.1106.0`, `2026.11.6`) | WARN `paperclip version is not recognized` |
+
+Значение от сервера в лог обрезается до 64 символов. Календарная проверка даты не выполняется. Если сам `/api/health` не ответил, пишется WARN `paperclip health check failed, continuing` и версия не проверяется. **Ни один случай не блокирует запуск.** Тесты: `src/paperclip/version.rs` (классификация и уровни логов), `tests/e2e_binary.rs` (запуск продолжается при другой, отсутствующей и нераспознанной версии).
 
 ## 4. Лента pending-решений: `GET /api/companies/{companyId}/attention`
 

@@ -1,8 +1,8 @@
 # Архитектура
 
-Документ описывает реализованное поведение и составлен по коду ветки `feat/bridge-v1` (`src/`, `Dockerfile`, `deploy/compose.example.yml`). Решения и их обоснование — в [docs/adr/](adr/), контракт Paperclip API — в [paperclip-api.md](paperclip-api.md). Номера строк относятся к коммиту, на котором написан документ; при сомнении ищите по имени функции.
+Документ описывает реализованное поведение и составлен по коду ветки `pet-12-improvements`, версия 1.1.0 (`src/`, `Dockerfile`, `deploy/`). Решения и их обоснование — в [docs/adr/](adr/), контракт Paperclip API — в [paperclip-api.md](paperclip-api.md). Номера строк относятся к коммиту, на котором написан документ; при сомнении ищите по имени функции.
 
-Доработки v1.1.0 (текстовые ответы как в чате, проверка версии Paperclip, host-network deployment, права secret-файлов) спроектированы в [ADR-0009](adr/0009-v1.1.0-improvements.md). Пока они не реализованы, разделы ниже описывают v1.
+Доработки v1.1.0 (текстовые ответы как в чате, проверка версии Paperclip, host-network deployment, права secret-файлов) спроектированы в [ADR-0009](adr/0009-v1.1.0-improvements.md) и описаны ниже: маршрутизация текста — §4 «Telegram → Paperclip» и «Текст как чат», миграция draft — §3 и §4, проверка версии — §4 «Старт». Вариант с `network_mode: host` — `deploy/compose.host-network.example.yml`: схема выше относится к изолированному примеру, различия — в [THREAT_MODEL](THREAT_MODEL.md) и [RUNBOOK](RUNBOOK.md) §6.
 
 ## 1. Схема
 
@@ -17,7 +17,7 @@
                                    └─────────────────────────────────┘
 ```
 
-- Входящих портов нет: в `Dockerfile` нет `EXPOSE`, в compose нет `ports:`.
+- Входящих портов нет: в `Dockerfile` нет `EXPOSE`, ни в одном compose-примере нет `ports:`.
 - Клиент Paperclip строится с `.no_proxy()` (`src/paperclip/http.rs`), клиент Telegram всегда с `Proxy::all(TELEGRAM_PROXY_URL)` (`src/telegram/http.rs`). Переменные `HTTP(S)_PROXY`/`ALL_PROXY` из окружения не читаются (`tests/env_proxy.rs`).
 - TLS до `api.telegram.org` устанавливается клиентом bridge сквозь соединение с proxy (rustls, провайдер `ring`); proxy TLS не терминирует. Само соединение bridge → proxy при схемах `socks5`/`socks5h`/`http` не шифруется, шифрование там зависит от выбранной схемы и сети. Транспорт до Paperclip определяется схемой `PAPERCLIP_URL` (`http://` или `https://`).
 
@@ -49,13 +49,21 @@
 | `meta` | служебные значения | `key`/`value`: `telegram_offset`, `runs_baseline_at`, `done_baseline_at`, `started_at`, `self_user_id` (`store/mod.rs:220-226`) |
 | `deliveries` | карточка Paperclip ↔ сообщение Telegram | `interaction_id` UNIQUE, `company_id`, `issue_id`, `issue_ref`, `kind`, `snapshot_json`, `status`, `gen` (поколение клавиатуры), `closed_reason`, `follow_until` |
 | `delivery_messages` | куски сообщения карточки | `(delivery_id, chunk)`, `message_id` |
-| `drafts` | черновики форм и ожидание текста | `delivery_id`, `step`, `answers_json`, `awaiting`, `prompt_message_id` |
+| `drafts` | черновики форм и ожидание текста. Для однотекстовых карточек (см. «Текст как чат») draft не создаётся | `delivery_id`, `step`, `answers_json`, `awaiting`, `prompt_message_id` |
 | `outbox` | очередь ответов в Paperclip | `delivery_id` UNIQUE, `action`, `body_json`, `status`, `attempts`, `next_attempt_at`, `last_error` |
 | `seen_runs`, `seen_done_issues` | уже показанные сбои runs и завершённые задачи | хранятся 14 дней (`runs.rs: SEEN_RETENTION`) |
 
 Статусы `deliveries.status`: `new`, `sending`, `sent`, `answering`, `answered`, `following`, `closed`, `unsupported`. Статусы `outbox.status`: `pending`, `in_flight`, `done`, `abandoned`. В БД **нет** токенов и ключей. В `body_json` лежит ответ пользователя; после завершения записи он обнуляется (`sqlite.rs:595-598`), но `snapshot_json` содержит текст карточки (вопросы агентов), поэтому файл состояния нужно защищать как конфиденциальный.
 
 ## 4. Потоки данных
+
+### Старт (`src/app.rs: run`)
+
+Порядок: открытие состояния и `recover()` (записи outbox `in_flight` возвращаются в `pending`) → **миграция draft** `Store::reset_chat_text_drafts()` (см. ниже) → создание клиентов → `GET /api/health` и **проверка версии** `paperclip::version::log_check` → запуск задач. Затем в фоне `startup_messages`: `setMyCommands`, уведомления о сброшенных draft, `announce_restart` (незавершённые формы).
+
+**Проверка версии** (`src/paperclip/version.rs`, ADR-0009 §3). Единственное место с проверенной версией — константа `TESTED_PAPERCLIP_VERSION` (`2026.1106.0`). `classify` относит `version` из `/api/health` к одному из случаев: `Tested` (точное совпадение после `trim`) → INFO `paperclip reachable` с `version_status="tested"`; `Other` (формат `YYYY.MMDD.N`, но другое значение) → WARN «paperclip version differs from the tested one» с `paperclip_version` и `tested_version`; `Missing` (поля нет или пусто) → WARN «paperclip version is missing»; `Unrecognized` (не формат `YYYY.MMDD.N`) → WARN «paperclip version is not recognized». Значение от сервера в логе обрезается до 64 символов. Если `/api/health` не ответил, пишется прежний WARN `paperclip health check failed, continuing`, версия не проверяется. Запуск не блокируется ни в одном случае.
+
+**Миграция draft** (ADR-0009 §2). В v1.0.0 для однотекстовой карточки создавался draft с preview и подтверждением; в v1.1.0 их нет. При каждом старте в одной транзакции удаляются draft карточек, у которых в snapshot ровно один вопрос с `mode == text`, независимо от статуса доставки, и `deliveries.gen` увеличивается на 1 (старые кнопки дают «Устарело»). В outbox ничего не пишется, текст draft не читается и **не отправляется**. Draft других карточек (форма из нескольких вопросов, Reject, вердикты) не трогаются. Для карточек в статусе `sent` `announce_chat_text_reset` перерисовывает карточку и шлёт сообщение «черновик сброшен, текст не отправлен»; ошибка перерисовки пишется в WARN и старт не останавливает. Повторный старт ничего не меняет: новый код такие draft не создаёт, отдельного флага в `meta` нет. Версия схемы БД не менялась. Тесты: `tests/draft_migration.rs`.
 
 ### Paperclip → Telegram (`sync::cycle`)
 
@@ -69,9 +77,21 @@
 ### Telegram → Paperclip
 
 1. `poller` получает update. `allowlist::check` пропускает только владельца в своём private-чате; чужое — `advance_offset` без ответа и без побочных эффектов (`dialog.rs:140-145`).
-2. Нажатие кнопки или текст превращаются в `Effects`; `commit_update` в **одной транзакции** применяет операции (черновик, постановка в outbox) и записывает `telegram_offset = update_id + 1` (`dialog.rs:161`, `sqlite.rs:148-170`). `update_id` меньше сохранённого offset считается дублем и пропускается.
+2. Нажатие кнопки или текст превращаются в `Effects` (маршрутизация текста — ниже); `commit_update` в **одной транзакции** применяет операции (черновик, постановка в outbox) и записывает `telegram_offset = update_id + 1` (`dialog.rs:161`, `sqlite.rs:148-170`). `update_id` меньше сохранённого offset считается дублем и пропускается.
 3. Затем идут побочные эффекты (ответ на callback, обновление сообщения); их сбой не критичен, состояние уже согласовано.
 4. `outbox` отправляет ответ (см. раздел 5) и закрывает карточку.
+
+### Текст как чат (`dialog::on_message`, `forms::chat_text_answer`)
+
+«Подходящая» карточка (`forms::is_chat_text_question`): статус `sent`, тело `ask_user_questions` из одного вопроса с `answerMode: text`. Для неё рендер не добавляет кнопок, а только подсказку «ответьте обычным сообщением» (`render/forms.rs`); любое нажатие кнопки со старой клавиатуры даёт «Устарело». Порядок разбора текстового сообщения после allowlist, нетекстовых вложений и команд, первое совпадение выигрывает:
+
+1. reply на prompt ожидающего сценария → текст в этот сценарий (как в v1);
+2. reply на карточку: подходящая → `chat_text_answer`; другая → прежний путь (`on_text`); не в `sent` → «уже закрыта или ответ отправлен»;
+3. reply на что-то иное считается сообщением без reply;
+4. draft, ожидающий текст (причина Reject, вердикта, шаг многовопросной формы) → текст в него;
+5. открытые подходящие карточки (`deliveries_with_status(Sent)` + фильтр): одна → `chat_text_answer`; несколько → просьба ответить reply на нужную, список `issue_ref`, ничего не отправляется; ни одной → «Сейчас нет вопросов, на которые можно ответить текстом. Сообщение не отправлено.».
+
+`chat_text_answer`: `validate_text` (длина, формат; нарушение даёт сообщение с причиной, а в состоянии ничего не меняется, вопрос открыт), затем `Effects::enqueue(Resolution::Respond { otherText })` + удаление остатка draft + сообщение «📨 … принят и поставлен в очередь отправки». Дальше путь тот же, что у любого ответа: `commit_update` в одной транзакции с offset, `outbox`, reconcile, защита `outbox.delivery_id UNIQUE` от второго ответа (§5). Опечатку отменить нельзя. Тесты: `tests/chat_text.rs`, `tests/crash.rs` (рестарт, повторная доставка), `docs/TESTING.md` «Пункт 1».
 
 ### Ошибки Paperclip при отправке ответа (`core/outbox.rs`, классификация — `paperclip/http.rs: classify`)
 
@@ -95,7 +115,7 @@
 
 Вопрос: может ли kill -9 в момент отправки ответа потерять его или отправить дважды. Ответ: **нет**; дублироваться может только карточка (вопрос) в Telegram.
 
-Порядок для обычного ответа (`confirmation`, `checkbox`, форма, вердикты):
+Порядок для обычного ответа (`confirmation`, `checkbox`, форма, вердикты, текст как чат):
 
 | Шаг | Где | Состояние на диске |
 |---|---|---|
