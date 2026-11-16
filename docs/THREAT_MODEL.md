@@ -34,7 +34,7 @@ Telegram (облако) и proxy — недоверенные; Paperclip — д�
 | **D** — рассинхронизация при двух экземплярах | два bridge на один бот | Telegram возвращает 409 на `getUpdates`; bridge пишет ошибку и ждёт до 5 минут (`poller.rs`). Защиты от двух экземпляров на одном томе нет (не проверено) |
 | **E** — эскалация через bridge | bridge выполняет только ответы на карточки и связанный formal approval | нет произвольных вызовов API; неподдерживаемые виды карточек не отвечаются; approvals, не связанные с `toolAction` этой карточки, не трогаются; перечень вызовов — [PAPERCLIP_PERMISSIONS](PAPERCLIP_PERMISSIONS.md) |
 | **E** — побег из контейнера | — | non-root, read-only rootfs, `cap_drop: [ALL]`, `no-new-privileges`, без портов (в compose-примере; в smoke-тесте проверяются non-root, read-only, отсутствие портов) |
-| Цепочка поставки | зависимости, базовые образы | `Cargo.lock` в репозитории, `cargo deny` (advisories, licenses, sources; job `deny` в CI), базовые образы закреплены по digest (`Dockerfile`). Автоматического обновления зависимостей (Dependabot/Renovate) в репозитории нет (не проверено) |
+| Цепочка поставки | зависимости, базовые образы | `Cargo.lock` в репозитории, `cargo deny` (advisories, licenses, sources; job `deny` в CI), базовые образы закреплены по digest (`Dockerfile`). Обновления зависимостей, actions и образов настроены через Dependabot (`.github/dependabot.yml`) |
 
 ## Остаточные риски
 
