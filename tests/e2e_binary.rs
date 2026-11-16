@@ -222,3 +222,46 @@ async fn sigterm_with_answer_in_flight_finishes_it() {
     assert_eq!(store.telegram_offset().await.unwrap(), 11);
     assert_eq!(posts(&env.paperclip, "/accept").await.len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_my_commands_registers_the_command_list_via_proxy() {
+    let env = Env::new().await;
+    serve(&env.paperclip, &[], vec![]).await;
+    Mock::given(method("POST"))
+        .and(path(format!("/bot{TOKEN}/getUpdates")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": true, "result": []}))
+                .set_delay(Duration::from_secs(20)),
+        )
+        .mount(&env.telegram)
+        .await;
+    let mut child = env.spawn();
+    let t0 = Instant::now();
+    let body = loop {
+        let found = env
+            .telegram
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.url.path().ends_with("/setMyCommands"));
+        if let Some(r) = found {
+            break serde_json::from_slice::<serde_json::Value>(&r.body).unwrap();
+        }
+        assert!(t0.elapsed() < Duration::from_secs(10), "no setMyCommands");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    sigterm(&child);
+    let status = wait_exit(&mut child, Duration::from_secs(8)).await;
+    assert!(status.success(), "exit status {status:?}");
+    let names: Vec<&str> = body["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["command"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["status", "backlog", "cancel", "help"]);
+    assert_eq!(body["scope"]["chat_id"], 111);
+    assert!(env.proxy.requests() >= 1, "setMyCommands must use the proxy");
+}
