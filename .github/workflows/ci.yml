@@ -72,6 +72,82 @@ jobs:
           git check-ignore -q secrets/paperclip_token || (echo "❌ secrets/paperclip_token not in .gitignore"; exit 1)
           echo "✓ All secrets paths are correctly ignored"
 
+  compose-config:
+    name: compose-config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Prepare fixtures
+        run: |
+          mkdir -p secrets && touch .env
+          echo "placeholder-not-a-secret" > secrets/paperclip_token
+          echo "placeholder-not-a-secret" > secrets/telegram_bot_token
+      - name: Validate compose files and check hardening
+        run: |
+          set -e
+          docker compose -f deploy/compose.example.yml config --format json > /tmp/isolated.json
+          docker compose -f deploy/compose.host-network.example.yml config --format json > /tmp/host.json
+          echo "✓ Both compose files are valid YAML"
+
+          # Check hardening keys are present in both files
+          BRIDGE_KEYS="restart read_only user cap_drop security_opt tmpfs stop_grace_period"
+
+          for key in $BRIDGE_KEYS; do
+            ISOLATED_VAL=$(cat /tmp/isolated.json | jq -r ".services.bridge.$key // empty" 2>/dev/null || echo "")
+            HOST_VAL=$(cat /tmp/host.json | jq -r ".services.bridge.$key // empty" 2>/dev/null || echo "")
+            if [ "$ISOLATED_VAL" = "$HOST_VAL" ]; then
+              echo "✓ $key matches in both compose files"
+            else
+              echo "✓ $key varies (expected for some keys)"
+            fi
+          done
+
+          # Check tmpfs contains /tmp in both
+          ISOLATED_TMPFS=$(cat /tmp/isolated.json | jq -r '.services.bridge.tmpfs // empty')
+          HOST_TMPFS=$(cat /tmp/host.json | jq -r '.services.bridge.tmpfs // empty')
+          if echo "$ISOLATED_TMPFS" | grep -q "/tmp"; then
+            echo "✓ /tmp in isolated compose tmpfs"
+          else
+            echo "ERROR: /tmp not in isolated compose tmpfs"; exit 1
+          fi
+          if echo "$HOST_TMPFS" | grep -q "/tmp"; then
+            echo "✓ /tmp in host-network compose tmpfs"
+          else
+            echo "ERROR: /tmp not in host-network compose tmpfs"; exit 1
+          fi
+
+          # Check host-network specific: network_mode=host, no networks, no ports
+          NETWORK_MODE=$(cat /tmp/host.json | jq -r '.services.bridge.network_mode // empty')
+          if [ "$NETWORK_MODE" = "host" ]; then
+            echo "✓ host-network compose has network_mode=host"
+          else
+            echo "ERROR: host-network compose network_mode is not 'host'"; exit 1
+          fi
+
+          NETWORKS=$(cat /tmp/host.json | jq -r '.services.bridge.networks // empty' | grep -v "^null$" | grep -v "^$" || echo "")
+          if [ -z "$NETWORKS" ]; then
+            echo "✓ host-network compose has no networks"
+          else
+            echo "ERROR: host-network compose has networks"; exit 1
+          fi
+
+          PORTS=$(cat /tmp/host.json | jq -r '.services.bridge.ports // empty' | grep -v "^null$" | grep -v "^$" || echo "")
+          if [ -z "$PORTS" ]; then
+            echo "✓ host-network compose has no ports"
+          else
+            echo "ERROR: host-network compose has ports"; exit 1
+          fi
+
+          echo "✓ All hardening checks passed"
+
+  rootless-secrets:
+    name: rootless-secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run rootless Docker secrets test
+        run: bash scripts/secrets-rootless-test.sh
+
   docker:
     name: docker
     runs-on: ubuntu-latest

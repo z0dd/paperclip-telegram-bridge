@@ -76,10 +76,10 @@ docker run --rm --network none -v "$PWD/secrets:/s" busybox:1.37 \
 install -d -m 0700 secrets
 ( umask 077; printf '%s' '<telegram bot token>' > secrets/telegram_bot_token )
 ( umask 077; printf '%s' '<paperclip token>'     > secrets/paperclip_token )
-# Больше ничего не делать, права `0644` уже установлены через umask
+chmod 0644 secrets/telegram_bot_token secrets/paperclip_token
 ```
 
-**Не используйте:** `chmod 0400`, `0600`, `0640` для файла хост-пользователя — они не работают в rootless Docker. Rootful Docker не проверялся.
+**Не используйте:** `chmod 0400`, `0600`, `0640` для файла, владелец которого хост-пользователь — они не работают в rootless Docker. Rootful Docker не проверялся.
 
 В `deploy/compose.example.yml` контейнер запускается с `read_only: true`, `user: 65532:65532`, `cap_drop: [ALL]`, `no-new-privileges`, без `ports:`, с именованным томом `bridge-state` на `/state`, и подключается только к внешним сетям `paperclip_internal` и `xray_egress` (имена-плейсхолдеры, замените на свои). Сети без маршрута в интернет — дополнительная защита от прямого выхода.
 
