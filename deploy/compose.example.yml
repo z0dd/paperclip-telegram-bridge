@@ -1,0 +1,41 @@
+# Example only: placeholders, no real addresses or secrets.
+# The bridge needs no published ports: all connections are outgoing.
+services:
+  bridge:
+    image: paperclip-telegram-bridge:local
+    restart: unless-stopped
+    read_only: true
+    user: "65532:65532"
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+    env_file: .env
+    environment:
+      PAPERCLIP_TOKEN_FILE: /run/secrets/paperclip_token
+      TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
+    secrets:
+      - paperclip_token
+      - telegram_bot_token
+    volumes:
+      - bridge-state:/state
+    networks:
+      - paperclip_internal
+      - xray_egress
+
+secrets:
+  paperclip_token:
+    file: ./secrets/paperclip_token
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token
+
+volumes:
+  bridge-state:
+
+networks:
+  # Attach only to the networks of Paperclip and the Xray proxy, without a
+  # route to the internet, so that a direct connection is impossible.
+  paperclip_internal:
+    external: true
+  xray_egress:
+    external: true
