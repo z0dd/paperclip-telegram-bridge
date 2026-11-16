@@ -213,3 +213,83 @@ async fn chat_text_crash_after_http_reconciles_without_a_second_answer() {
     assert_eq!(posts(&server, "/respond").await.len(), 1);
     assert_eq!(h.ctx.store.pending_outbox_count().await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn chat_text_reply_survives_a_restart_and_is_sent_once() {
+    // Same as the no-reply variant above, but the text is a reply to the card.
+    let _guard = SERIAL.lock().await;
+    let server = MockServer::start().await;
+    serve(&server, &["q-1"], vec![text_card()]).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let h = Harness::start(&server.uri(), &[]).await;
+    h.sync().await;
+    let msg = h.delivery("q-1").await.last_message_id().unwrap();
+    h.text("reply survives", Some(msg)).await;
+    assert_eq!(h.delivery("q-1").await.status, DeliveryStatus::Answering);
+
+    let h = h.restart().await;
+    bridge::core::forms::announce_restart(&h.ctx).await.unwrap();
+    h.outbox().await;
+    assert_eq!(
+        posts(&server, "/respond").await,
+        vec![
+            json!({"answers": [{"questionId": "notes", "optionIds": [], "otherText": "reply survives"}],
+                    "summaryMarkdown": null})
+        ]
+    );
+    assert_eq!(h.delivery("q-1").await.status, DeliveryStatus::Answered);
+}
+
+#[tokio::test]
+async fn chat_text_without_reply_crash_after_http_reconciles_without_a_second_answer() {
+    // The only pending card is answered by a plain message; the process dies
+    // after the HTTP call but before the outbox commit.
+    let _guard = SERIAL.lock().await;
+    let server = MockServer::start().await;
+    serve(&server, &["q-1"], vec![text_card()]).await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/issues/{ISSUE}/interactions/q-1/respond"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let h = Harness::start(&server.uri(), &[]).await;
+    h.sync().await;
+    h.text("plain in flight", None).await;
+    fault::arm(fault::AFTER_HTTP_BEFORE_OUTBOX_COMMIT);
+    assert!(h.try_outbox().await.is_err(), "crash injected");
+
+    serve(
+        &server,
+        &[],
+        vec![resolved(
+            text_card(),
+            "answered",
+            Some("user-1"),
+            None,
+            json!({"version": 1, "answers": [{"questionId": "notes", "optionIds": [], "otherText": "plain in flight"}]}),
+        )],
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/issues/{ISSUE}/interactions/q-1/respond"
+        )))
+        .respond_with(
+            ResponseTemplate::new(409).set_body_json(
+                json!({"error": "resolved", "code": "interaction_already_resolved"}),
+            ),
+        )
+        .mount(&server)
+        .await;
+    let h = h.restart().await;
+    h.outbox().await;
+    assert_eq!(h.delivery("q-1").await.status, DeliveryStatus::Answered);
+    assert_eq!(posts(&server, "/respond").await.len(), 1);
+    assert_eq!(h.ctx.store.pending_outbox_count().await.unwrap(), 0);
+}

@@ -71,6 +71,8 @@ jobs:
           git check-ignore -q secrets/telegram_bot_token || (echo "❌ secrets/telegram_bot_token not in .gitignore"; exit 1)
           git check-ignore -q secrets/paperclip_token || (echo "❌ secrets/paperclip_token not in .gitignore"; exit 1)
           echo "✓ All secrets paths are correctly ignored"
+      - name: Negative test (check fails without the rules)
+        run: bash scripts/gitignore-check-test.sh
 
   compose-config:
     name: compose-config

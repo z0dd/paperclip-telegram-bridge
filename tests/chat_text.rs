@@ -507,3 +507,21 @@ async fn multi_question_form_still_uses_the_text_button() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn reply_to_a_message_that_is_not_a_card_is_routed_like_plain_text() {
+    // Row 10: a reply to an arbitrary message (not a card, not a prompt) is
+    // handled as a message without reply, here row 12.
+    let server = MockServer::start().await;
+    serve(&server, &["q-1"], vec![text_card("q-1", None)]).await;
+    respond_ok(&server).await;
+    let h = Harness::start(&server.uri(), &[]).await;
+    h.sync().await;
+    h.text("answer via foreign reply", Some(777_777)).await;
+    assert_eq!(last_text(&h), QUEUED);
+    h.outbox().await;
+    assert_eq!(
+        posts(&server, "/respond").await,
+        vec![answer("answer via foreign reply")]
+    );
+}
