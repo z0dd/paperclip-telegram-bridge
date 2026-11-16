@@ -11,7 +11,7 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m
-    stop_grace_period: 20s  # Must be > 2 × SHUTDOWN_GRACE (10s), recommended 3×
+    stop_grace_period: 30s  # Must be > 2 × SHUTDOWN_GRACE (10s), recommended 3×
     network_mode: host
     env_file: .env
     environment:
