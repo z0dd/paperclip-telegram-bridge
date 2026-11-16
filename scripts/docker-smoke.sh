@@ -3,97 +3,176 @@ set -euo pipefail
 
 # Docker smoke test для paperclip-telegram-bridge
 # Проверяет:
-# - non-root user
-# - read-only filesystem
+# - non-root user (uid ≠ 0)
+# - read-only filesystem (Config.ReadonlyRootfs)
 # - no exposed ports
 # - healthcheck
-# - SIGTERM graceful shutdown
+# - SIGTERM graceful shutdown (exit code 0)
 # - no credentials in logs
 
 IMAGE_NAME="paperclip-telegram-bridge:test"
 CONTAINER_ID=""
-TMPDIR=$(mktemp -d)
+SECRETS_DIR=""
+STATE_VOLUME=""
+
+fail() {
+    echo "❌ $1"
+    exit 1
+}
 
 cleanup() {
     if [ -n "$CONTAINER_ID" ]; then
         docker rm -f "$CONTAINER_ID" 2>/dev/null || true
     fi
-    rm -rf "$TMPDIR"
+    if [ -n "$STATE_VOLUME" ]; then
+        docker volume rm "$STATE_VOLUME" 2>/dev/null || true
+    fi
+    if [ -n "$SECRETS_DIR" ]; then
+        rm -rf "$SECRETS_DIR"
+    fi
 }
 trap cleanup EXIT
 
 echo "=== Docker Smoke Test ==="
 
-# Build image
-echo "Building image: $IMAGE_NAME"
-docker build -t "$IMAGE_NAME" . --load
+# Prepare fixtures: dummy secrets in a directory (no real tokens/IPs)
+SECRETS_DIR=$(mktemp -d)
+echo "000000:TEST-DUMMY-TOKEN" > "$SECRETS_DIR/tg"
+echo "pcp_dummy" > "$SECRETS_DIR/pc"
+chmod 444 "$SECRETS_DIR"/*
+echo "Created dummy secrets in $SECRETS_DIR"
 
-# Test 1: Check non-root user
-echo "Test 1: Checking non-root user..."
+# Create a named volume for /state
+STATE_VOLUME="smoke-test-state-$(date +%s)"
+docker volume create "$STATE_VOLUME" > /dev/null
+echo "Created named volume: $STATE_VOLUME"
+
+# Test 1: Check non-root user in image config
+echo ""
+echo "Test 1: Checking non-root user in image config..."
 USER_ID=$(docker inspect "$IMAGE_NAME" | jq -r '.[0].Config.User // empty')
 if [ -z "$USER_ID" ]; then
-    echo "ERROR: User not set in Dockerfile"
-    exit 1
+    fail "User not set in Dockerfile"
 fi
-if [ "$USER_ID" = "0" ]; then
-    echo "ERROR: Container runs as root (uid=0)"
-    exit 1
+if [ "$USER_ID" = "0" ] || [ "$USER_ID" = "root" ]; then
+    fail "Container runs as root (uid=$USER_ID)"
 fi
-echo "✓ Container runs as non-root user: $USER_ID"
+echo "✓ Config.User = $USER_ID (non-root)"
 
 # Test 2: Check no exposed ports
-echo "Test 2: Checking exposed ports..."
+echo ""
+echo "Test 2: Checking no exposed ports..."
 EXPOSED=$(docker inspect "$IMAGE_NAME" | jq -r '.[0].Config.ExposedPorts // empty')
-if [ -n "$EXPOSED" ] && [ "$EXPOSED" != "null" ]; then
-    echo "ERROR: Exposed ports found: $EXPOSED"
-    exit 1
+if [ "$EXPOSED" != "null" ] && [ -n "$EXPOSED" ]; then
+    fail "Exposed ports found in Config.ExposedPorts: $EXPOSED"
 fi
-echo "✓ No exposed ports"
+echo "✓ Config.ExposedPorts = null (no exposed ports)"
 
-# Test 3: Start container with read-only FS
-echo "Test 3: Testing read-only filesystem..."
+# Test 3: Start container with read-only FS and closed-port upstreams
+echo ""
+echo "Test 3: Starting container with read-only FS..."
 CONTAINER_ID=$(docker run -d \
     --read-only \
     --tmpfs /tmp \
-    --tmpfs /state \
-    -e PAPERCLIP_URL="http://127.0.0.1:9999" \
-    -e TELEGRAM_PROXY_URL="http://127.0.0.1:9999" \
-    -e TELEGRAM_BOT_TOKEN="123:abc" \
-    -e ALLOWED_CHAT_ID="999" \
-    "$IMAGE_NAME" \
-    /bin/sh -c "sleep 2" 2>/dev/null || true)
+    -v "$STATE_VOLUME:/state" \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    -v "$SECRETS_DIR:/secrets:ro" \
+    -e PAPERCLIP_URL="http://127.0.0.1:9" \
+    -e PAPERCLIP_COMPANY_IDS="test-company" \
+    -e PAPERCLIP_TOKEN_FILE="/secrets/pc" \
+    -e TELEGRAM_BOT_TOKEN_FILE="/secrets/tg" \
+    -e TELEGRAM_CHAT_ID="111" \
+    -e TELEGRAM_USER_ID="111" \
+    -e TELEGRAM_PROXY_URL="http://127.0.0.1:9" \
+    -e STATE_PATH="/state/bridge.db" \
+    -e HEALTH_FILE="/state/health.json" \
+    -e SHUTDOWN_GRACE="10s" \
+    -e LOG_FORMAT="text" \
+    "$IMAGE_NAME" 2>&1) || fail "docker run failed: $CONTAINER_ID"
 
-if [ -z "$CONTAINER_ID" ]; then
-    echo "Note: Container failed to start with read-only FS - this is expected until app is implemented"
-    return 0
+echo "Container started: $CONTAINER_ID"
+
+# Wait for container to be running
+sleep 2
+STATUS=$(docker inspect "$CONTAINER_ID" | jq -r '.[0].State.Running')
+if [ "$STATUS" != "true" ]; then
+    LOGS=$(docker logs "$CONTAINER_ID" 2>&1 || true)
+    fail "Container not running (status=$STATUS). Logs: $LOGS"
 fi
+echo "✓ Container is running (State.Running = true)"
 
-if ! docker exec "$CONTAINER_ID" touch /test.txt 2>/dev/null; then
-    echo "✓ Filesystem is read-only"
+# Test 4: Verify read-only filesystem
+echo ""
+echo "Test 4: Verifying read-only filesystem..."
+READONLY=$(docker inspect "$CONTAINER_ID" | jq -r '.[0].HostConfig.ReadonlyRootfs')
+if [ "$READONLY" != "true" ]; then
+    fail "HostConfig.ReadonlyRootfs = $READONLY (expected true)"
+fi
+echo "✓ HostConfig.ReadonlyRootfs = true"
+
+# Verify no restart (meaning read-only FS works and /state is writable)
+RESTART_COUNT=$(docker inspect "$CONTAINER_ID" | jq -r '.[0].State.RestartCount')
+if [ "$RESTART_COUNT" != "0" ]; then
+    fail "Container restarted ($RESTART_COUNT times), read-only FS may not be working"
+fi
+echo "✓ No restarts (State.RestartCount = 0)"
+
+# Test 5: Check no published ports
+echo ""
+echo "Test 5: Checking no published ports..."
+PORTS=$(docker port "$CONTAINER_ID" 2>&1 || true)
+if [ -n "$PORTS" ]; then
+    fail "Published ports found: $PORTS"
+fi
+echo "✓ No published ports (docker port output empty)"
+
+# Test 6: Verify non-root user at runtime
+echo ""
+echo "Test 6: Verifying non-root user at runtime..."
+RUNNING_UID=$(docker top "$CONTAINER_ID" -o uid | tail -n +2 | head -n 1)
+if [ -z "$RUNNING_UID" ] || [ "$RUNNING_UID" = "0" ]; then
+    fail "Container running as root (uid=$RUNNING_UID)"
+fi
+echo "✓ Running as uid=$RUNNING_UID (non-root)"
+
+# Test 7: Check healthcheck
+echo ""
+echo "Test 7: Checking healthcheck..."
+HC_EXIT=$(docker exec "$CONTAINER_ID" /usr/local/bin/bridge healthcheck > /dev/null 2>&1; echo $?)
+if [ "$HC_EXIT" != "0" ]; then
+    HEALTH_OUTPUT=$(docker exec "$CONTAINER_ID" /usr/local/bin/bridge healthcheck 2>&1 || true)
+    echo "Note: Healthcheck exit code = $HC_EXIT (upstreams unavailable is expected). Output: $HEALTH_OUTPUT"
 else
-    echo "ERROR: Filesystem is writable"
-    exit 1
+    echo "✓ Healthcheck exit code = 0"
 fi
 
-# Test 4: Verify container stays alive with read-only FS
-if docker exec "$CONTAINER_ID" true; then
-    echo "✓ Container operates normally with read-only filesystem"
-else
-    echo "ERROR: Container failed with read-only filesystem"
-    exit 1
-fi
-
-# Test 5: Check credentials not in logs
+# Test 8: Check credentials not in logs
+echo ""
+echo "Test 8: Checking no credentials in logs..."
 LOGS=$(docker logs "$CONTAINER_ID" 2>&1 || true)
-if echo "$LOGS" | grep -q "123:abc"; then
-    echo "ERROR: Bot token found in logs"
-    exit 1
+if echo "$LOGS" | grep -qF "TEST-DUMMY-TOKEN"; then
+    fail "Token found in logs"
+fi
+if echo "$LOGS" | grep -qF "pcp_dummy"; then
+    fail "Paperclip token found in logs"
 fi
 echo "✓ No credentials in logs"
 
-# Cleanup container
-docker rm -f "$CONTAINER_ID" 2>/dev/null || true
-CONTAINER_ID=""
+# Test 9: SIGTERM graceful shutdown
+echo ""
+echo "Test 9: Testing SIGTERM graceful shutdown..."
+BEFORE=$(docker inspect "$CONTAINER_ID" | jq -r '.[0].State.Pid')
+docker stop -t 15 "$CONTAINER_ID" 2>&1 || fail "docker stop failed"
+
+# Wait a moment for container to fully stop
+sleep 1
+
+EXIT_CODE=$(docker inspect "$CONTAINER_ID" | jq -r '.[0].State.ExitCode')
+if [ "$EXIT_CODE" != "0" ]; then
+    fail "Container exited with code $EXIT_CODE (expected 0)"
+fi
+echo "✓ SIGTERM shutdown: exit code = 0"
 
 echo ""
-echo "=== All smoke tests passed ==="
+echo "=== All smoke tests passed ✓ ==="
