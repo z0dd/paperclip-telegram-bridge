@@ -850,6 +850,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "humantime",
+ "libc",
  "rand",
  "reqwest",
  "rusqlite",

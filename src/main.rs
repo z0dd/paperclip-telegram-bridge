@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::process::ExitCode;
 
-use bridge::config::{Config, Env, HealthConfig};
+use bridge::config::{Config, Env, HealthConfig, RevokeConfig};
 use bridge::{app, health, logging, shutdown, timeutil};
 use tokio_util::sync::CancellationToken;
 
-const USAGE: &str = "usage: bridge [run|check-config|healthcheck]";
+const USAGE: &str = "usage: bridge [run|check-config|healthcheck|revoke-paperclip-key]";
 
 /// Exit codes: 0 — ok, 1 — runtime failure or unhealthy, 2 — invalid configuration or usage.
 fn main() -> ExitCode {
@@ -14,6 +14,7 @@ fn main() -> ExitCode {
         None | Some("run") => run(),
         Some("check-config") => check_config(),
         Some("healthcheck") => healthcheck(),
+        Some("revoke-paperclip-key") => revoke_paperclip_key(),
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -35,6 +36,17 @@ fn load_config() -> Result<Config, ExitCode> {
 fn check_config() -> ExitCode {
     match load_config() {
         Ok(cfg) => {
+            logging::install_tls_provider();
+            // Builds the clients without any network call: proves the proxy
+            // URL is usable by the HTTP stack.
+            if let Err(e) =
+                bridge::telegram::HttpTelegramClient::new(&cfg.telegram).and_then(|_| {
+                    bridge::paperclip::HttpPaperclipClient::from_config(&cfg.paperclip).map(|_| ())
+                })
+            {
+                eprintln!("configuration error: {e}");
+                return ExitCode::from(2);
+            }
             println!(
                 "configuration OK: {} compan{}, telegram proxy scheme {}",
                 cfg.paperclip.company_ids.len(),
@@ -48,6 +60,59 @@ fn check_config() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(code) => code,
+    }
+}
+
+/// Revokes the board key from `PAPERCLIP_TOKEN_FILE` via
+/// `POST /api/cli-auth/revoke-current` (runbook: leak or suspicion).
+fn revoke_paperclip_key() -> ExitCode {
+    let vars: HashMap<String, String> = std::env::vars().collect();
+    let cfg = match RevokeConfig::from_env(&Env::new(&vars)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("configuration error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    logging::install_tls_provider();
+    let client = match bridge::paperclip::HttpPaperclipClient::new(
+        &cfg.url,
+        cfg.token,
+        cfg.connect_timeout,
+        cfg.request_timeout,
+        cfg.request_timeout,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: cannot start async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    use bridge::paperclip::PaperclipApi;
+    match rt.block_on(client.revoke_current_key()) {
+        Ok(()) => {
+            println!(
+                "Paperclip key revoked. Create a new key and update the secret file before restarting the bridge."
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!(
+                "revocation failed: {} — revoke the key in the Paperclip UI",
+                e.class()
+            );
+            ExitCode::FAILURE
+        }
     }
 }
 

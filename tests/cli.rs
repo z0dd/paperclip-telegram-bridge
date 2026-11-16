@@ -111,3 +111,60 @@ fn healthcheck_exit_codes() {
         .code(1);
     assert!(String::from_utf8_lossy(&out.get_output().stdout).contains("stale"));
 }
+
+fn revoke_cmd(secrets: &Secrets, url: &str) -> Command {
+    let mut cmd = bridge();
+    cmd.env("PAPERCLIP_URL", url)
+        .env("PAPERCLIP_TOKEN_FILE", secrets.dir.path().join("pc"))
+        .arg("revoke-paperclip-key");
+    cmd
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoke_paperclip_key_calls_revoke_current() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/cli-auth/revoke-current"))
+        .and(header("authorization", "Bearer pcp_board_placeholder"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"revoked": true})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let s = Secrets::new();
+    let mut cmd = revoke_cmd(&s, &server.uri());
+    let out = tokio::task::spawn_blocking(move || cmd.assert().success().get_output().clone())
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("revoked"));
+    // Only the revoke config is needed: no Telegram variables were set.
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoke_failure_is_reported_without_secrets() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(401).set_body_json(serde_json::json!({"error": "Unauthorized"})),
+        )
+        .mount(&server)
+        .await;
+    let s = Secrets::new();
+    let mut cmd = revoke_cmd(&s, &server.uri());
+    let out = tokio::task::spawn_blocking(move || cmd.assert().code(1).get_output().clone())
+        .await
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(all.contains("auth_401"), "{all}");
+    assert!(!all.contains("pcp_board_placeholder"));
+    assert!(!all.contains("127.0.0.1"));
+}
