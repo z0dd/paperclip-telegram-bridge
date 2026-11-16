@@ -1,165 +1,107 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Secret file permissions validation and compose structure test
-# Checks ADR-0009 §4 requirements for secret file access in compose files
+# Secret file permissions in rootless Docker (ADR-0009 §4).
+# Requires a running rootless Docker daemon (DOCKER_HOST points at it) and the
+# compose plugin. CI installs it with scripts/rootless-docker-install.sh.
+# Every case runs a hardened compose service (read_only, user 65532:65532,
+# cap_drop ALL, no-new-privileges, `secrets:`) and compares the observed result
+# with the expected one; any mismatch exits 1. Secret contents are never printed.
 
-echo "=== Secret File Permissions & Compose Validation Test ==="
-echo ""
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORK="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/secrets-rootless.XXXXXX")"
+PROJECT="secrets-rootless-$$"
+BUSYBOX="busybox:1.37"
 
-# Use repo secrets and deploy directories
-REPO_ROOT="${PAPERCLIP_WORKSPACE_CWD:-.}"
-TEST_DIR="$REPO_ROOT"
+fail() { echo "❌ $1"; exit 1; }
 
-echo "Working directory: $TEST_DIR"
+cleanup() {
+    (cd "$WORK" 2>/dev/null && docker compose -p "$PROJECT" -f compose.yml -f override.yml down -v >/dev/null 2>&1) || true
+    chmod -R u+rwX "$WORK" 2>/dev/null || true
+    rm -rf "$WORK" 2>/dev/null || true
+}
+trap cleanup EXIT
 
-# Prepare fixtures if they don't exist
-if [ ! -d "$TEST_DIR/secrets" ]; then
-  mkdir -p "$TEST_DIR/secrets"
-fi
-if [ ! -f "$TEST_DIR/secrets/test_secret" ]; then
-  printf "placeholder-not-a-secret" > "$TEST_DIR/secrets/test_secret"
-fi
-if [ ! -f "$TEST_DIR/deploy/.env" ]; then
-  touch "$TEST_DIR/deploy/.env"
-fi
+docker info --format '{{.SecurityOptions}}' | grep -q rootless \
+    || fail "docker daemon is not rootless (SecurityOptions has no 'rootless')"
 
-echo ""
-echo "=== Test 1: Repository compose files validation ==="
+# --- 1. UID mapping: container 65532 == host subuid_start + 65531 ----------
+SUBUID_START=$(awk -F: -v u="$(id -un)" '$1 == u { print $2; exit }' /etc/subuid)
+[ -n "$SUBUID_START" ] || fail "no /etc/subuid entry for $(id -un)"
+EXPECTED_UID=$((SUBUID_START + 65531))
 
-# Validate compose files with docker compose
-cd "$TEST_DIR/deploy" || exit 1
+mkdir -p "$WORK/probe"
+chmod 0777 "$WORK/probe"
+docker run --rm --network none --user 65532:65532 -v "$WORK/probe:/p" "$BUSYBOX" touch /p/owned-by-container
+ACTUAL_UID=$(stat -c %u "$WORK/probe/owned-by-container")
+[ "$ACTUAL_UID" = "$EXPECTED_UID" ] \
+    || fail "UID mapping: file owner on host is $ACTUAL_UID, expected $EXPECTED_UID (subuid_start $SUBUID_START + 65531)"
+echo "✓ UID mapping: container 65532 -> host $ACTUAL_UID (subuid_start $SUBUID_START + 65531)"
 
-if docker compose -f compose.example.yml config >/dev/null 2>&1; then
-  echo "✓ compose.example.yml is valid"
-else
-  echo "ERROR: compose.example.yml validation failed"; exit 1
-fi
+# --- 2. Hardened compose service reading /run/secrets/telegram_bot_token ----
+cp "$REPO_ROOT/deploy/compose.host-network.example.yml" "$WORK/compose.yml"
+: > "$WORK/.env"
+cat > "$WORK/override.yml" <<YAML
+services:
+  bridge:
+    image: $BUSYBOX
+    entrypoint:
+      - sh
+      - -c
+      - |
+        if head -c1 /run/secrets/telegram_bot_token >/dev/null 2>&1; then r=readable; else r=denied; fi
+        echo "RESULT=\$r uid=\$(id -u)"
+      - sh
+YAML
+mkdir -p "$WORK/secrets"
+chmod 0700 "$WORK/secrets"
+cd "$WORK"
+docker pull -q "$BUSYBOX" >/dev/null
 
-if docker compose -f compose.host-network.example.yml config >/dev/null 2>&1; then
-  echo "✓ compose.host-network.example.yml is valid"
-else
-  echo "ERROR: compose.host-network.example.yml validation failed"; exit 1
-fi
+# Prepares both secret files with the placeholder and the given recipe.
+prepare() {
+    rm -f secrets/paperclip_token secrets/telegram_bot_token
+    ( umask 077
+      printf '%s' placeholder-not-a-secret > secrets/telegram_bot_token
+      printf '%s' placeholder-not-a-secret > secrets/paperclip_token )
+    case "$1" in
+        strict)  # recommended recipe from README
+            docker run --rm --network none -v "$WORK/secrets:/s" "$BUSYBOX" \
+                sh -c 'chown 65532:65532 /s/telegram_bot_token /s/paperclip_token && chmod 0400 /s/telegram_bot_token /s/paperclip_token' ;;
+        0400|0600|0640|0644)
+            chmod "$1" secrets/telegram_bot_token secrets/paperclip_token ;;
+        *) fail "unknown recipe $1" ;;
+    esac
+}
 
-# Check required hardening keys in both files
-echo ""
-echo "=== Test 2: Checking hardening requirements ==="
+host_can_read() { head -c1 secrets/telegram_bot_token >/dev/null 2>&1 && echo yes || echo no; }
 
-ISOLATED=$(docker compose -f compose.example.yml config --format json)
-HOST=$(docker compose -f compose.host-network.example.yml config --format json)
+run_case() { # recipe expected-container-result expected-host-read
+    local recipe=$1 want=$2 want_host=$3 out got host
+    prepare "$recipe"
+    out=$(docker compose -p "$PROJECT" -f compose.yml -f override.yml run --rm --no-deps -T bridge 2>&1) \
+        || fail "[$recipe] docker compose run failed: $out"
+    got=$(printf '%s\n' "$out" | grep -E '^RESULT=' | tail -n1) || fail "[$recipe] no RESULT line in output: $out"
+    host=$(host_can_read)
+    echo "  [$recipe] container: $got; host reads: $host; owner uid: $(stat -c %u secrets/telegram_bot_token); mode: $(stat -c %a secrets/telegram_bot_token)"
+    [ "$got" = "RESULT=$want uid=65532" ] || fail "[$recipe] container result '$got', expected 'RESULT=$want uid=65532'"
+    [ "$host" = "$want_host" ] || fail "[$recipe] host read '$host', expected '$want_host'"
+    echo "✓ [$recipe] matches expectation (container $want, host reads $want_host)"
+}
 
-# Check tmpfs in both
-for FILE in "isolated (compose.example.yml)" "host (compose.host-network.example.yml)"; do
-  CONFIG=$([ "${FILE:0:1}" = "i" ] && echo "$ISOLATED" || echo "$HOST")
-  if echo "$CONFIG" | jq -e '.services.bridge.tmpfs | type == "array" and (.[] | select(contains("/tmp")))' >/dev/null 2>&1; then
-    echo "✓ $FILE has tmpfs with /tmp"
-  else
-    echo "ERROR: $FILE missing /tmp in tmpfs"; exit 1
-  fi
-done
+echo "=== matrix (recipe, container result, host can read) ==="
+run_case strict readable no     # 0400, owner subuid+65531 (recommended)
+run_case 0400   denied   yes    # 0400, host user owner
+run_case 0600   denied   yes
+run_case 0640   denied   yes
+run_case 0644   readable yes    # dir 0700 + file 0644 (acceptable)
 
-# Check user (should be same in both)
-USER_ISOLATED=$(echo "$ISOLATED" | jq -r '.services.bridge.user // empty')
-USER_HOST=$(echo "$HOST" | jq -r '.services.bridge.user // empty')
-if [ "$USER_ISOLATED" = "65532:65532" ] && [ "$USER_HOST" = "65532:65532" ]; then
-  echo "✓ Both files have user 65532:65532"
-else
-  echo "ERROR: User mismatch or incorrect"; exit 1
-fi
+# --- 3. host network sanity for QA (informational + sanity assertion) ------
+echo "=== docker run --network host $BUSYBOX ip -o -4 addr ==="
+IP_OUT=$(docker run --rm --network host "$BUSYBOX" ip -o -4 addr)
+echo "$IP_OUT"
+printf '%s\n' "$IP_OUT" | awk '{print $2}' | grep -qvE '^(lo|tap0)$' \
+    || fail "network_mode host in rootless sees only lo/tap0: host interfaces are not visible"
+echo "✓ host interfaces visible with --network host"
 
-# Check cap_drop in both
-for FILE in "isolated (compose.example.yml)" "host (compose.host-network.example.yml)"; do
-  CONFIG=$([ "${FILE:0:1}" = "i" ] && echo "$ISOLATED" || echo "$HOST")
-  if echo "$CONFIG" | jq -e '.services.bridge.cap_drop | index("ALL")' >/dev/null 2>&1; then
-    echo "✓ $FILE has cap_drop: [ALL]"
-  else
-    echo "ERROR: $FILE missing cap_drop ALL"; exit 1
-  fi
-done
-
-# Check no-new-privileges
-for FILE in "isolated (compose.example.yml)" "host (compose.host-network.example.yml)"; do
-  CONFIG=$([ "${FILE:0:1}" = "i" ] && echo "$ISOLATED" || echo "$HOST")
-  if echo "$CONFIG" | jq -e '.services.bridge.security_opt | index("no-new-privileges:true")' >/dev/null 2>&1; then
-    echo "✓ $FILE has no-new-privileges:true"
-  else
-    echo "ERROR: $FILE missing no-new-privileges:true"; exit 1
-  fi
-done
-
-# Check host-network specific: network_mode=host, no networks, no ports
-echo ""
-echo "=== Test 3: Host-network specific checks ==="
-NETWORK_MODE=$(echo "$HOST" | jq -r '.services.bridge.network_mode // empty')
-if [ "$NETWORK_MODE" = "host" ]; then
-  echo "✓ Host-network compose has network_mode=host"
-else
-  echo "ERROR: network_mode is not 'host' (got: $NETWORK_MODE)"; exit 1
-fi
-
-NETWORKS=$(echo "$HOST" | jq '.services.bridge.networks // empty')
-if [ "$NETWORKS" = "null" ] || [ -z "$NETWORKS" ]; then
-  echo "✓ Host-network compose has no networks defined"
-else
-  echo "ERROR: Host-network compose has networks"; exit 1
-fi
-
-PORTS=$(echo "$HOST" | jq '.services.bridge.ports // empty')
-if [ "$PORTS" = "null" ] || [ -z "$PORTS" ]; then
-  echo "✓ Host-network compose has no ports defined"
-else
-  echo "ERROR: Host-network compose has ports"; exit 1
-fi
-
-# Check read_only in both
-for FILE in "isolated (compose.example.yml)" "host (compose.host-network.example.yml)"; do
-  CONFIG=$([ "${FILE:0:1}" = "i" ] && echo "$ISOLATED" || echo "$HOST")
-  READONLY=$(echo "$CONFIG" | jq -r '.services.bridge.read_only // empty')
-  if [ "$READONLY" = "true" ]; then
-    echo "✓ $FILE has read_only: true"
-  else
-    echo "ERROR: $FILE read_only is not true"; exit 1
-  fi
-done
-
-echo ""
-echo "=== Test 4: Secret file permissions concepts ==="
-
-# Create test directory for permissions testing
-TESTFILE="$TEST_DIR/test_strict"
-mkdir -p "$TEST_DIR"
-
-# Test strict variant (0400)
-printf "placeholder-not-a-secret" > "$TESTFILE"
-chmod 0400 "$TESTFILE"
-FILE_MODE=$(stat -c %a "$TESTFILE" 2>/dev/null || echo "")
-if [ "$FILE_MODE" = "400" ]; then
-  echo "✓ Strict variant: 0400 set correctly"
-else
-  echo "ERROR: Strict variant got $FILE_MODE, expected 400"; exit 1
-fi
-
-# Test permissive variant (0644 requires explicit chmod, umask 077 gives 0600)
-TESTFILE2="$TEST_DIR/test_perm"
-( umask 077; printf "placeholder-not-a-secret" > "$TESTFILE2" )
-FILE_MODE=$(stat -c %a "$TESTFILE2" 2>/dev/null || echo "")
-if [ "$FILE_MODE" = "600" ]; then
-  echo "✓ Permissive variant: umask 077 creates 0600 (need explicit chmod 0644 for 0644)"
-else
-  echo "ERROR: Permissive variant got $FILE_MODE, expected 600"; exit 1
-fi
-
-echo ""
-echo "=== All validation tests passed ✓ ==="
-echo ""
-echo "Summary:"
-echo "  ✓ Both compose files are valid YAML"
-echo "  ✓ Hardening requirements met (tmpfs, user, cap_drop, security_opt, read_only)"
-echo "  ✓ Host-network compose properly configured (network_mode=host, no networks/ports)"
-echo "  ✓ Secret file permissions validated"
-echo ""
-echo "Notes:"
-echo "  - For full rootless Docker test, run on local machine with usernamespace support"
-echo "  - Strict: 0400 (container UID-owned)"
-echo "  - Permissive: explicit 'chmod 0644' in 0700 directory"
+echo "=== all secret permission checks passed ✓ ==="
