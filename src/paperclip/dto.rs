@@ -144,6 +144,8 @@ pub fn interaction(v: &Value) -> Option<Interaction> {
         created_at: s(v, "createdAt").unwrap_or_default(),
         resolved_by_user_id: s(v, "resolvedByUserId"),
         resolved_by_agent_id: s(v, "resolvedByAgentId"),
+        addressee_agent_id: s(v, "addresseeAgentId"),
+        addressee_user_id: s(v, "addresseeUserId"),
         body,
         result: v.get("result").filter(|r| r.is_object()).map(result),
     })

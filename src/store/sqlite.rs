@@ -306,6 +306,8 @@ fn placeholder_interaction() -> Interaction {
         created_at: String::new(),
         resolved_by_user_id: None,
         resolved_by_agent_id: None,
+        addressee_agent_id: None,
+        addressee_user_id: None,
         body: InteractionBody::Unsupported {
             reason: UnsupportedReason::Malformed,
         },

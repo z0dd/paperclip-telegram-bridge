@@ -98,6 +98,8 @@ pub struct Interaction {
     pub created_at: String,
     pub resolved_by_user_id: Option<String>,
     pub resolved_by_agent_id: Option<String>,
+    pub addressee_agent_id: Option<String>,
+    pub addressee_user_id: Option<String>,
     pub body: InteractionBody,
     pub result: Option<InteractionResult>,
 }

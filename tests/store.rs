@@ -16,6 +16,8 @@ fn interaction(id: &str) -> Interaction {
         created_at: "2026-11-15T10:00:00.000Z".into(),
         resolved_by_user_id: None,
         resolved_by_agent_id: None,
+        addressee_agent_id: None,
+        addressee_user_id: None,
         body: InteractionBody::Confirmation(Confirmation {
             prompt: "Ok?".into(),
             details: None,
