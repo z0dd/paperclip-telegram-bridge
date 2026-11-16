@@ -4,9 +4,9 @@ set -euo pipefail
 # Rootless Docker smoke test: secret file permissions
 # Checks ADR-0009 §4 requirements for secret file access
 
-DOCKER_VERSION="29.10.0"
-DOCKER_SHA256="2f56b1bbdd18d94b46bb05f96bb35a6b00d1ff8de15a0f2ee96e3f066a06e9b3"
-EXTRAS_SHA256="1aeb35dc9eda71be76ae968ed7f69849e4dbfb4fc9e3fe8c27c6b56f27d4fea9"
+DOCKER_VERSION="27.0.0"
+DOCKER_SHA256="4e2f88cc1b1a20fb6b3b151bd3cd7e96fea3f7bccd7caa7b71c86fc8f17cc98e"
+EXTRAS_SHA256="52e5a5a38a5c7f56597ef37d60be2ef56ed686e8c038e6cd8d4c8dd8f9fd6b81"
 
 TMPDIR_ROOTLESS=$(mktemp -d)
 trap "rm -rf $TMPDIR_ROOTLESS" EXIT

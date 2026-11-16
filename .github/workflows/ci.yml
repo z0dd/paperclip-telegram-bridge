@@ -79,9 +79,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Prepare fixtures
         run: |
-          mkdir -p secrets && touch .env
+          mkdir -p secrets deploy
           echo "placeholder-not-a-secret" > secrets/paperclip_token
           echo "placeholder-not-a-secret" > secrets/telegram_bot_token
+          touch deploy/.env
       - name: Validate compose files and check hardening
         run: |
           set -e
