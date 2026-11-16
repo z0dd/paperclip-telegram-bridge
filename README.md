@@ -4,7 +4,7 @@ A bridge service connecting Paperclip infrastructure to Telegram, enabling secur
 
 ## Overview
 
-This service acts as a middleware between Paperclip and Telegram, supporting both incoming and outgoing message flows with idempotent delivery, full encryption, and authentication. All traffic is routed through the Xray proxy — no direct connections to Telegram are possible.
+This service acts as a middleware between Paperclip and Telegram, supporting both incoming and outgoing message flows with idempotent delivery and authentication. All traffic is routed through the Xray proxy — no direct connections to Telegram are possible.
 
 **Key properties:**
 - **Idempotent**: duplicate requests produce one effect; answers are never lost or duplicated after restart
@@ -43,6 +43,7 @@ CONNECT_TIMEOUT=10s
 RETRY_BASE_DELAY=1s
 RETRY_MAX_DELAY=60s
 RETRY_MAX_ATTEMPTS=6
+RETRY_NOTIFY_AFTER=5                       # After N retries, send a notification
 NOTIFY_RUN_FAILURES=true                   # Send notifications for run failures
 NOTIFY_TASK_COMPLETED=false                # Send when tasks complete
 NOTIFY_RESOLVED_ELSEWHERE=true             # Send when cards are resolved outside Telegram
@@ -102,10 +103,16 @@ The container exposes no ports: all network connections are outgoing (to Papercl
    - `/status` — show current bridge and Paperclip state
    - `/backlog` — list pending approvals and notifications
 
-To revoke the board key and issue a new one:
+To revoke the board key in case of leak or suspicion:
 ```bash
-docker exec bridge revoke-paperclip-key
-# Create new key in Paperclip UI, update the secret file, restart the bridge
+# Revoke the current key programmatically (requires PAPERCLIP_TOKEN_FILE and PAPERCLIP_URL in environment)
+bridge revoke-paperclip-key
+
+# Or revoke it manually in the Paperclip UI:
+# 1. Go to Board API Keys in settings
+# 2. Find the active key and revoke it
+# 3. Create a new key
+# 4. Update PAPERCLIP_TOKEN_FILE with the new token and restart the bridge
 ```
 
 ## Graceful Shutdown and stop_grace_period
@@ -136,14 +143,14 @@ stop_grace_period: 35s  # > 2×15s
 
 ## Backup and Restore
 
-State is stored in SQLite (`/state/bridge.db` and WAL files). To back up:
+State is stored in SQLite (`/state/bridge.db` and WAL files) in the mounted volume. To back up:
 
 ```bash
 # Stop the bridge
 docker compose down
 
-# Copy the state
-cp -r /path/to/bridge-state backup-$(date +%Y%m%d).tar.gz
+# Create archive of the state volume
+tar -czf backup-$(date +%Y%m%d).tar.gz -C /path/to/volumes bridge-state/
 
 # Restart
 docker compose up
@@ -155,9 +162,14 @@ To restore from a backup:
 # Stop the bridge
 docker compose down
 
-# Restore the state
-rm -rf /path/to/bridge-state/*
-tar -xzf backup-DATE.tar.gz -C /path/to/bridge-state/
+# Remove current state
+sudo rm -rf /path/to/volumes/bridge-state
+
+# Extract from backup
+sudo tar -xzf backup-DATE.tar.gz -C /path/to/volumes/
+
+# Verify permissions (should be readable by uid 65532)
+sudo chown -R 65532:65532 /path/to/volumes/bridge-state
 
 # Restart
 docker compose up
@@ -170,11 +182,10 @@ On restart, the bridge automatically:
 
 ## Architecture and Design
 
-See [`docs/`](docs/) for detailed architecture, design decisions (ADRs), and test coverage:
+See [`docs/`](docs/) for detailed documentation and design decisions:
 
-- `architecture.md` — system design, threat model, API contracts
 - `TESTING.md` — test coverage matrix and how to run tests locally
-- `paperclip-api.md` — Paperclip API contract and error handling
+- `paperclip-api.md` — Paperclip API contract, endpoints, and error handling
 - `adr/` — architectural decision records (ADR-0001 through ADR-0008)
 
 ## Known Limitations (v1)
@@ -184,6 +195,7 @@ See [`docs/`](docs/) for detailed architecture, design decisions (ADRs), and tes
 - **Governance decisions are Telegram-only**: Decisions (approvals, confirmations) can only be made via Telegram buttons; the UI shows decisions as read-only.
 - **No message history sync**: Only new messages after startup are bridged; history is not synced from Telegram or Paperclip.
 - **Heartbeat file required**: Health check depends on `/state/health.json`. If `/state` is lost, health goes stale (but data recovers from DB).
+- **Forms with >20 questions**: Question forms with more than 20 answerable questions cannot be completed via Telegram (API limit); users are directed to the Paperclip UI instead.
 
 ## Development
 
