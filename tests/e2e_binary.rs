@@ -263,5 +263,8 @@ async fn set_my_commands_registers_the_command_list_via_proxy() {
         .collect();
     assert_eq!(names, ["status", "backlog", "cancel", "help"]);
     assert_eq!(body["scope"]["chat_id"], 111);
-    assert!(env.proxy.requests() >= 1, "setMyCommands must use the proxy");
+    assert!(
+        env.proxy.requests() >= 1,
+        "setMyCommands must use the proxy"
+    );
 }
