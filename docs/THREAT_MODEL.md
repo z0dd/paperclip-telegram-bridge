@@ -1,137 +1,45 @@
-# Threat Model and Security Analysis
+# Threat model (STRIDE)
 
-## Scope
+Основа — архитектурный набросок (раздел 10 архитектуры этапа 1), приведённый в соответствие с реализацией. Для каждой меры указано, где она в коде или тестах. Если мера не проверена, это написано.
 
-This v1 release runs the bridge in a controlled environment (trusted network, private Paperclip, Xray proxy, secrets in Docker secrets). The threat model assumes:
+## Активы
 
-- **Trusted container host**: Docker daemon and volumes are not compromised.
-- **Trusted networks**: Paperclip is on a private network (not internet-facing).
-- **Trusted proxy**: Xray proxy is properly configured and not compromised.
-- **Secrets handling**: Tokens are provided via Docker secrets (read-only files), not environment variables.
-- **Telegram account**: User controls the bot token; 2FA is recommended.
+- Board API key Paperclip: полный доступ пользователя-владельца, **бессрочный** (решение пользователя, [ADR-0002](adr/0002-board-api-key.md)). Сузить его по правам нельзя (`paperclip-api.md` §2).
+- Токен бота Telegram. Он входит в URL Bot API.
+- Содержание вопросов и ответов, право подтверждать действия агентов (включая write/destructive-действия инструментов и привязку существующих секретов к агентам).
+- Файл состояния `/state/bridge.db` (в нём тексты карточек, ответы в очереди, но не ключи).
 
-## STRIDE Analysis
+## Границы доверия
 
-### Spoofing
+Telegram (облако) и proxy — недоверенные; Paperclip — доверенный, но приватный; контейнер bridge — доверенный, минимально привилегированный: non-root `65532`, read-only rootfs, `cap_drop: [ALL]`, `no-new-privileges`, без портов, writable только `/state` (`Dockerfile`, `deploy/compose.example.yml`; проверка non-root, портов и read-only — шаги 1, 2, 4, 6–8 `scripts/docker-smoke.sh`).
 
-**Threat**: Attacker impersonates the bridge, Paperclip, or Telegram API.
+## Угрозы
 
-- **Bridge ↔ Paperclip**: Token in `PAPERCLIP_TOKEN_FILE` is opaque (user controls secret file). Bearer auth over HTTPS (to private Paperclip). **Mitigation**: Store token in Docker secret; don't expose in env.
-- **Bridge ↔ Telegram**: Bot token in `TELEGRAM_BOT_TOKEN_FILE`; Telegram API enforces token ownership. **Mitigation**: Protect token file; use 2FA to prevent account takeover.
-- **User ↔ Telegram**: Telegram client-server connection uses TLS. **Mitigation**: Recommended 2FA in Telegram settings.
+| Угроза | Вектор | Меры и где они реализованы |
+|---|---|---|
+| **S** — подделка пользователя | чужой аккаунт пишет боту или нажимает кнопку | allowlist по chat и user, только private-чат (`src/core/allowlist.rs`); `from.id` выставляет Telegram; чужие updates молча пропускаются, offset продвигается (`dialog.rs: handle_update`). Тесты: `tests/core_flow.rs::foreign_updates_are_ignored_silently`, unit-тесты в `allowlist.rs` |
+| **S** — подделка callback | изменённый клиент шлёт свой `callback_data` | `callback_data` (`v1:<op>:<did>:<gen>…`) не содержит ID Paperclip, каждое нажатие проверяется по состоянию (доставка существует и открыта, `gen` текущий, индексы в пределах snapshot), иначе «Устарело» (`render/callback.rs`, `dialog.rs: on_callback`, ADR-0006). Окончательную авторизацию выполняет Paperclip |
+| **S** — компрометация аккаунта Telegram владельца | кража сессии, SIM-swap, открытое чужое устройство | **Главный остаточный риск №2.** Атакующий делает всё, что владелец делает через bridge: отвечает на вопросы, одобряет write-действия инструментов, привязывает существующие секреты, при `GOVERNED_DESTRUCTIVE_MODE=confirm` — и destructive-действия (второй шаг защищает только от случайного нажатия). Не может: прочитать значение секрета, создать задачу или произвольное действие, «запомнить» разрешение (`rememberAction` не отправляется, `http.rs: governed_accept`), одобрить действие после срока или с изменёнными аргументами (сверка `argumentsHash`/`target.revisionId`, `governed.rs: changed`, повторно в outbox). Меры: 2FA и контроль сессий (обязательная рекомендация в README); `GOVERNED_APPROVALS_ENABLED=false` или `ui_only`; `/revoke` бота в BotFather, затем отзыв ключа и аудит ([RUNBOOK](RUNBOOK.md)); журнал решений (`decision from telegram queued`: `update_id`, `interaction_id`, `kind`, `risk`, `action`, без содержимого). PIN в чате не используется: он виден тому, кто читает чат |
+| **T** — подмена трафика к Telegram | MITM | TLS (rustls) клиентом bridge до `api.telegram.org` сквозь proxy; proxy TLS не терминирует. Отдельная проверка сертификатов своим тестом не покрыта (не проверено) |
+| **T** — подмена содержания governed-карточки между показом и решением | агент или сервер пересоздал действие с другими аргументами | перед отправкой bridge перечитывает карточку и сверяет `argumentsHash` и `target.revisionId` со snapshot (`governed.rs`); сервер дополнительно проверяет подпись аргументов (по контракту, `paperclip-api.md` §6.6; на живом сервере не проверялось) |
+| **T** — порча состояния | диск, ручная правка | `integrity_check` при старте, версия схемы, отказ старта без автопочинки (`sqlite.rs`, `tests/store.rs::corrupt_database_is_refused`), backup ([BACKUP_RESTORE](BACKUP_RESTORE.md)) |
+| **R** — «кто ответил» | ответы идут от имени владельца ключа | Paperclip фиксирует `resolvedByUserId` и activity (`paperclip-api.md` §6, §11); bridge логирует `interaction_id` и исход. По Paperclip UI отличить «из Telegram» нельзя, только по журналу bridge |
+| **I** — утечка board key | логи, образ, окружение, backup, файл секрета | ключ только из файла `PAPERCLIP_TOKEN_FILE`, переменной с токеном нет; хранится как `SecretString` (`config.rs`), в `Debug` печатается `[REDACTED]` (`config.rs::secrets_are_redacted_in_debug`); не логируется; в состояние не пишется. **Ключ бессрочный**: украденный ключ действует до отзыва, главная мера — быстрый отзыв ([RUNBOOK](RUNBOOK.md)), рекомендация плановой ротации раз в 90 дней |
+| **I** — утечка токена бота | логи (токен в URL), образ | ошибки reqwest сводятся к классу и никогда не форматируются с URL (`.without_url()`, `telegram/http.rs`, `paperclip/http.rs`); тест `tests/telegram_proxy.rs::token_is_not_in_errors_or_logs_on_connection_failure`. Утекший токен позволяет читать updates и писать в чат от имени бота, но не отвечать в Paperclip. Отзыв — `/revoke` в BotFather |
+| **I** — учётные данные proxy | URL proxy может содержать логин и пароль | тип `ProxyUrl` хранит URL как секрет, печатает только схему (`config.rs`, `config.rs::proxy_debug_hides_credentials`) |
+| **I** — содержание вопросов в Telegram | облако Telegram, proxy | принимаемый риск продукта. В логах содержания нет. Ссылки на UI по умолчанию не отправляются (`PAPERCLIP_UI_URL` пуст). Аргументы governed-действий по умолчанию не отправляются (`GOVERNED_SHOW_ARGUMENTS=false`) |
+| **I** — приватные адреса | ссылки, сообщения об ошибках | `PAPERCLIP_UI_URL` пуст по умолчанию; в сообщениях о сбоях runs только статус и `errorCode` (`runs.rs`), без `error`/`stderr` |
+| **D** — флуд updates | чужие сообщения | отказ до разбора, журнал не чаще 1 записи в 10 с с счётчиком подавленных (`allowlist.rs: LOG_INTERVAL`) |
+| **D** — недоступность proxy или Paperclip | сбой сети | backoff, очередь ответов в SQLite, прямого пути к Telegram нет (`tests/telegram_proxy.rs::unavailable_proxy_means_zero_direct_requests`) |
+| **D** — рассинхронизация при двух экземплярах | два bridge на один бот | Telegram возвращает 409 на `getUpdates`; bridge пишет ошибку и ждёт до 5 минут (`poller.rs`). Защиты от двух экземпляров на одном томе нет (не проверено) |
+| **E** — эскалация через bridge | bridge выполняет только ответы на карточки и связанный formal approval | нет произвольных вызовов API; неподдерживаемые виды карточек не отвечаются; approvals, не связанные с `toolAction` этой карточки, не трогаются; перечень вызовов — [PAPERCLIP_PERMISSIONS](PAPERCLIP_PERMISSIONS.md) |
+| **E** — побег из контейнера | — | non-root, read-only rootfs, `cap_drop: [ALL]`, `no-new-privileges`, без портов (в compose-примере; в smoke-тесте проверяются non-root, read-only, отсутствие портов) |
+| Цепочка поставки | зависимости, базовые образы | `Cargo.lock` в репозитории, `cargo deny` (advisories, licenses, sources; job `deny` в CI), базовые образы закреплены по digest (`Dockerfile`). Автоматического обновления зависимостей (Dependabot/Renovate) в репозитории нет (не проверено) |
 
-**Residual risk**: If host is compromised, attacker can read secrets; if Xray config is broken, Telegram token may leak.
+## Остаточные риски
 
-### Tampering
-
-**Threat**: Attacker modifies messages in transit or state on disk.
-
-- **Bridge → Telegram**: TLS to proxy, then to Telegram API (authenticated). **Mitigation**: Proxy must enforce TLS; bridge validates Telegram responses for errors.
-- **State (SQLite)**: Stored in `/state` volume (not encrypted at rest). **Mitigation**: Use encrypted storage (e.g., dm-crypt) if required by policy; bridge runs in immutable container (no direct shell access).
-- **Approval workflow**: Bridge sends decision to Paperclip; Paperclip validates business rules. Bridge does not make final decisions (user does in Telegram UI).
-
-**Residual risk**: Attacker with host access can modify `/state/bridge.db` offline; Paperclip must validate all decisions server-side.
-
-### Repudiation
-
-**Threat**: Attacker denies approving or rejecting a decision.
-
-- **Audit trail**: Bridge logs all interactions (timestamp, user, decision, Paperclip response). Paperclip maintains canonical audit log.
-- **Message traceability**: Telegram message IDs and Paperclip issue IDs are linked in bridge logs.
-
-**Mitigation**: All decisions logged to stdout (captured by docker logs); Paperclip enforces server-side validation.
-
-### Information Disclosure
-
-**Threat**: Sensitive data (tokens, approval decisions, arguments) is exposed.
-
-- **Secrets in env**: Never; always in files.
-- **Secrets in logs**: Redaction built-in (tokens never logged). **Mitigation**: Review logs for sensitive content; use `GOVERNED_SHOW_ARGUMENTS=false` to hide function arguments in Telegram previews.
-- **Secrets in Docker image**: Build-time only (Dockerfile has no embedded secrets); final image is distroless (minimal surface).
-- **Secrets in state**: SQLite contains message content (encrypted at Paperclip level if required); bridge DB is not encrypted but can be.
-- **Secrets in Telegram**: Bot token is private (user controls); approval decisions are encrypted by Telegram client-server TLS.
-
-**Residual risk**: Host compromise leaks all secrets; unencrypted SQLite DB can be read if volume is extracted.
-
-### Denial of Service
-
-**Threat**: Attacker prevents bridge from functioning.
-
-- **Resource exhaustion**: Container is limited by Docker resource constraints (memory, CPU). Polling loops do not spawn unbounded tasks.
-- **Infinite loops**: Attention feed has max page limit (ATTENTION_MAX_PAGES=10); pagination cursor handles loops.
-- **Telegram rate limit**: Bridge respects 429 (rate-limit) response with backoff; after max attempts, notifies user and skips.
-- **Paperclip rate limit**: Retries with exponential backoff; no retry storm.
-- **Crash loop**: Graceful shutdown + health file; Docker restart policy prevents crash loops.
-
-**Mitigation**: Use resource limits in Docker Compose; monitor health file; set restart policy to `unless-stopped`.
-
-**Residual risk**: If Xray proxy is unavailable, bridge cannot reach Telegram (accepted per design; bridge remains available for polling Paperclip).
-
-### Elevation of Privilege
-
-**Threat**: Attacker gains unauthorized access to Paperclip or Telegram via bridge.
-
-- **Paperclip API**: Bridge operates with a single board token (admin-like). **Mitigation**: Least-privilege token (ideally: read attention, write interactions, read approvals, etc., no delete); store in Docker secret.
-- **Telegram bot**: Bridge controls the bot. User cannot escalate via Telegram (user can only approve/reject within Paperclip's permissions).
-- **Container process**: Runs as uid 65532 (non-root); no setuid binaries.
-
-**Mitigation**: Use a dedicated, scoped board token; enable 2FA to prevent Telegram account takeover; do not run as root.
-
-**Residual risk**: If board token is overly permissive or compromised, attacker can impersonate bridge in Paperclip.
-
-## Mitigation Strategies
-
-1. **Secrets Management**:
-   - Use Docker secrets (mounted as read-only files, uid 65532)
-   - Never pass secrets via environment variables
-   - Rotate board token regularly (see RUNBOOK.md)
-   - Enable 2FA in Telegram account
-
-2. **Network Isolation**:
-   - Keep Paperclip on private network (no internet routing)
-   - Force all Telegram traffic through authenticated proxy (Xray)
-   - Use VPN or firewall rules to restrict bridge host access
-
-3. **Audit and Monitoring**:
-   - Enable Docker log collection (forward to centralized logging)
-   - Monitor health file for staleness
-   - Alert on high retry counts or Telegram errors
-
-4. **Data Protection**:
-   - Use encrypted storage for `/state` volume (optional, policy-dependent)
-   - Run SQLite with encryption (future enhancement)
-   - Backups: store encrypted offsite; restrict access
-
-5. **Incident Response**:
-   - If bot token leaked: Revoke in BotFather (`/revoke`), issue new token
-   - If board token leaked: Revoke in Paperclip, issue new token, rotate bridge secret
-   - If Xray proxy compromised: Pause bridge, rotate proxy credentials, validate no messages leaked
-
-## Residual Risks (Accepted in v1)
-
-| Risk | Severity | Mitigation | Acceptance |
-|------|----------|-----------|-----------|
-| Host compromise leaks all secrets | High | Secure host, detect intrusions, isolate network | Operator responsibility |
-| SQLite DB not encrypted at rest | Medium | Use dm-crypt or EBS encryption if required by policy | Optional future enhancement |
-| Overly permissive board token | Medium | Use least-privilege token; rotate regularly | Board token scope defined by Paperclip admin |
-| Telegram account takeover (2FA off) | Medium | Enable 2FA in Telegram settings | User responsibility |
-| Xray proxy misconfiguration | Medium | Validate proxy rules; test with tcpdump | Operator responsibility |
-| User shares Telegram chat (side-channel) | Low | Not in scope; trust model includes trusted user | Accepted |
-
-## Security Best Practices for Operators
-
-1. **Initial Setup**:
-   - Create a dedicated Paperclip board key (don't reuse admin token)
-   - Create bot via BotFather; enable 2FA in Telegram
-   - Run bridge on isolated host; use firewall rules to restrict access
-
-2. **Ongoing Operations**:
-   - Rotate board token quarterly (see RUNBOOK.md)
-   - Monitor bridge logs for auth errors or unusual retry patterns
-   - Keep Docker and base OS patched
-   - Use encrypted backups; test restore procedures quarterly
-
-3. **Incident Response**:
-   - Document procedure for rotating both tokens (board key and bot token)
-   - Have backup communication channel if primary is compromised
-   - Test recovery from SQLite backup before need arises
+1. **Бессрочный board key с полным доступом пользователя.** При компрометации контейнера атакующий получает всё, что может пользователь Paperclip, до отзыва ключа. Принято пользователем.
+2. **Захват Telegram-аккаунта** позволяет одобрять действия инструментов и привязку секретов (строка S выше). Принято пользователем; ограничивается флагами `GOVERNED_*`, 2FA и runbook.
+3. **Governed-ветка не проверена на живом Paperclip** (README, «Известные ограничения»). До первой реальной проверки поведение подтверждено только contract-тестами.
+4. **Состояние на диске не шифруется**: `bridge.db` содержит тексты карточек; защита — права на том и хост.
+5. Содержание вопросов проходит через Telegram.

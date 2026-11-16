@@ -1,301 +1,92 @@
-# Development Guide
+# Руководство разработчика
 
-## Prerequisites
+Команды ниже повторяют то, что выполняет CI (`.github/workflows/ci.yml`). Документ составлен без локального Rust-тулчейна и Docker (на машине автора их не было), поэтому подтверждением служит зелёный CI на том же коммите, а не локальный запуск.
 
-- Rust 1.82+ (install via [rustup](https://rustup.rs/))
-- Docker (for local testing and image builds)
-- `docker-compose` (for integration tests)
-- `git`
+## Требования
 
-## Project Structure
+- Rust **1.100** (`rust-version = "1.100"` в `Cargo.toml`, CI использует toolchain `1.100.0`). Файла `rust-toolchain` в репозитории нет, версию ставьте сами.
+- C-компилятор: SQLite собирается из исходников (`rusqlite` с feature `bundled`).
+- Docker и `jq` — только для `scripts/docker-smoke.sh`.
+- Прочего (OpenSSL, `cmake`) не нужно: TLS — `rustls` с провайдером `ring`, `aws-lc-sys` в зависимостях нет (ADR-0005).
+
+## Сборка и проверки
+
+```bash
+cargo build                                          # бинарь target/debug/bridge
+cargo fmt --all -- --check                           # job fmt
+cargo clippy --all-targets --all-features -- -D warnings   # job clippy
+cargo test --all-features                            # job test (включая crash-тесты)
+cargo deny check all                                 # job deny (нужен cargo-deny; настройки в deny.toml)
+docker build -t paperclip-telegram-bridge:test . && bash scripts/docker-smoke.sh   # job docker
+```
+
+Запуск тестов и их покрытие: [TESTING.md](TESTING.md).
+
+## Локальный запуск
+
+Переменные окружения из `.env` самим бинарём **не загружаются** (`.env.example` — просто шаблон для `docker compose`/`env_file`). Задавайте переменные в оболочке:
+
+```bash
+mkdir -p /tmp/bridge-dev && umask 077
+printf '%s' '<токен бота>' > /tmp/bridge-dev/tg
+printf '%s' '<board key>'  > /tmp/bridge-dev/pc
+
+export PAPERCLIP_URL=http://127.0.0.1:3100
+export PAPERCLIP_TOKEN_FILE=/tmp/bridge-dev/pc
+export PAPERCLIP_COMPANY_IDS=<id компании>
+export TELEGRAM_BOT_TOKEN_FILE=/tmp/bridge-dev/tg
+export TELEGRAM_CHAT_ID=<id чата> TELEGRAM_USER_ID=<id пользователя>
+export TELEGRAM_PROXY_URL=socks5h://127.0.0.1:1080
+export STATE_PATH=/tmp/bridge-dev/bridge.db HEALTH_FILE=/tmp/bridge-dev/health.json
+export LOG_FORMAT=text LOG_LEVEL=debug       # RUST_LOG не читается
+
+cargo run -- check-config     # проверка без сети
+cargo run -- run
+```
+
+Значения по умолчанию для `STATE_PATH` и `HEALTH_FILE` (`/state/...`) на хосте недоступны для записи, поэтому переопределите их, как выше. Proxy обязателен и при локальном запуске: без него процесс не стартует. Не используйте реальные секреты в файлах репозитория и не коммитьте их.
+
+## Структура
 
 ```
 src/
-├── main.rs                 # Entry points: run, check-config, revoke-paperclip-key
-├── app.rs                  # Main application loop (polling, graceful shutdown)
-├── config.rs               # Configuration parsing (environment variables)
-├── domain.rs               # Core types (Attention, Interaction, Approval, etc.)
-├── core/
-│   ├── mod.rs              # Core application logic
-│   ├── dialog.rs           # Event handling (callbacks, messages, commands)
-│   ├── commands.rs         # Bot commands (/status, /backlog, /help, /cancel)
-│   ├── sender.rs           # Outbox and delivery orchestration
-│   └── allowlist.rs        # User ID allowlist enforcement
-├── paperclip/
-│   ├── mod.rs              # Paperclip API trait
-│   └── http.rs             # HTTP client for Paperclip (reqwest-based)
-├── telegram/
-│   ├── mod.rs              # Telegram API trait
-│   ├── http.rs             # HTTP client for Telegram API
-│   └── types.rs            # Telegram types (Update, Message, Callback, etc.)
-├── store/
-│   ├── mod.rs              # Storage trait
-│   └── sqlite.rs           # SQLite implementation (WAL mode)
-├── render.rs               # HTML/Telegram markup rendering
-├── timeutil.rs             # Timestamp parsing and formatting
-└── logging.rs              # Structured logging setup (JSON or text)
-
-tests/
-├── core_flow.rs            # Integration tests (Q&A flow, idempotency, allowlist)
-├── store.rs                # SQLite recovery and idempotency tests
-└── telegram_proxy.rs       # Proxy enforcement tests
-
-deploy/
-├── compose.example.yml     # Example Docker Compose configuration
-└── .env.example            # Environment variable template
+  main.rs           подкоманды run / check-config / healthcheck / revoke-paperclip-key, коды выхода
+  app.rs            сборка сервиса, запуск задач, остановка
+  config.rs         переменные окружения, SecretString, ProxyUrl
+  health.rs         heartbeat-файл и его проверка
+  shutdown.rs       SIGTERM/SIGINT -> CancellationToken
+  retry.rs          backoff с jitter
+  fault.rs          точки отказа для тестов (feature fault-injection)
+  logging.rs        tracing, хеш ID, провайдер TLS
+  timeutil.rs       время и форматирование
+  domain/           типы карточек, черновиков, задач, runs (каталог)
+  paperclip/        PaperclipApi (trait), DTO, HttpPaperclipClient
+  telegram/         TelegramApi (trait), типы Bot API, HttpTelegramClient
+  render/           карточки в HTML, клавиатуры, callback_data (каталог)
+  store/            Store и SQL (sqlite.rs)
+  core/             poller, dialog, sync, runs, outbox, sender, governed, forms, commands, allowlist, cards
+tests/              интеграционные тесты; tests/support — общая обвязка (mock Paperclip на wiremock, fake Telegram, proxy)
+scripts/            docker-smoke.sh, check-testing-refs.sh
+deploy/             compose.example.yml (пример)
+docs/               документация, adr/
 ```
 
-## Local Development
+Приёмы, которые встретите в коде:
 
-### 1. Clone and Setup
+- `PaperclipApi` и `TelegramApi` — traits с методами `-> impl Future`; боевая реализация — `Http*Client`, в тестах — mock-серверы wiremock и fake-реализации (`#[async_trait]` не используется).
+- `core` не знает про SQLite: только `Store` и его методы, каждый — одна транзакция.
+- Любое журналирование передаёт идентификаторы, виды и классы ошибок, но не тексты и не URL. Ошибки reqwest никогда не форматируются как есть (в URL Telegram — токен): используйте `.without_url()` и сводите к классу.
 
-```bash
-git clone https://github.com/z0dd/paperclip-telegram-bridge.git
-cd paperclip-telegram-bridge
+## Типовые изменения
 
-# Copy env template
-cp deploy/.env.example .env.local
+| Задача | Что трогать |
+|---|---|
+| Новая переменная окружения | `src/config.rs` (разбор, значение по умолчанию, тест в том же файле), `.env.example`, таблица в `README.md` |
+| Новый вызов Paperclip | метод в `PaperclipApi` (`src/paperclip/mod.rs`), реализация в `http.rs`, DTO в `dto.rs`, тест в `tests/paperclip_contract.rs`, строка в `docs/PAPERCLIP_PERMISSIONS.md` |
+| Изменение схемы БД | новая запись в `MIGRATIONS` и `SCHEMA_VERSION` в `src/store/sqlite.rs`; существующие миграции не редактировать |
+| Новое поведение карточек | `src/render/` и `src/core/`, тест в `tests/core_flow.rs`, `forms_flow.rs` или `governed.rs` |
+| Изменение таблицы покрытия | `docs/TESTING.md`; `bash scripts/check-testing-refs.sh` проверяет, что каждая ссылка «файл::тест» существует |
 
-# Edit .env.local with your Paperclip/Telegram details
-# (or use mock servers for testing; see TESTING.md)
-```
+## Правила репозитория
 
-### 2. Check Configuration
-
-```bash
-# Validate config without starting the service
-cargo run --bin bridge -- check-config
-```
-
-This loads `.env.local` and reports any missing or invalid variables without starting the server.
-
-### 3. Run Locally (Development Mode)
-
-```bash
-# Requires real Paperclip and Telegram (see TESTING.md for mocks)
-cargo run --bin bridge -- run
-
-# With debug logging
-RUST_LOG=debug cargo run --bin bridge -- run
-```
-
-### 4. Build Docker Image (Local)
-
-```bash
-# Build and tag locally
-docker build -t paperclip-telegram-bridge:local .
-
-# Run with Docker Compose (for integration tests)
-docker compose -f deploy/compose.example.yml up
-```
-
-## Code Style and Formatting
-
-### Automatic Formatting
-
-```bash
-cargo fmt           # Format all code
-cargo fmt -- --check  # Check without modifying
-```
-
-### Linting and Auditing
-
-```bash
-cargo clippy        # Lint for common mistakes
-cargo clippy -- -D warnings  # Fail on warnings
-
-cargo deny check     # Audit dependencies for security/license issues
-```
-
-### Pre-commit Hook (Optional)
-
-To prevent committing badly formatted code:
-
-```bash
-# Add to .git/hooks/pre-commit
-#!/bin/sh
-set -e
-cargo fmt -- --check
-cargo clippy -- -D warnings
-echo "Formatting and linting passed ✓"
-```
-
-## Testing
-
-See [TESTING.md](TESTING.md) for comprehensive test strategy and how to run:
-
-```bash
-cargo test           # All unit + integration tests
-cargo test --test core_flow  # Specific test file
-```
-
-## Debugging
-
-### Log Levels
-
-```bash
-# Development
-RUST_LOG=debug cargo run --bin bridge -- run
-
-# Specific module
-RUST_LOG=bridge::paperclip=debug,bridge::telegram=warn cargo run --bin bridge -- run
-```
-
-### Inspecting State
-
-```bash
-# Connect to SQLite during development
-sqlite3 /tmp/bridge-state/bridge.db
-
-# Query outbox
-sqlite> SELECT id, issue_ref, status, created_at FROM outbox LIMIT 5;
-```
-
-### Docker Debugging
-
-```bash
-# Shell into running container
-docker compose exec -it bridge sh
-
-# View logs
-docker compose logs -f bridge
-
-# Inspect image layers
-docker history paperclip-telegram-bridge:local
-
-# Check for secrets in image
-docker save paperclip-telegram-bridge:local | tar -x && grep -r "token\|secret" .
-```
-
-## Key Components to Understand
-
-### 1. Application Loop (src/app.rs)
-
-Entry point for the `run` subcommand. Sets up:
-- Configuration loading
-- Database initialization
-- Tokio runtime (async)
-- Three polling tasks (attention, runs, health)
-- SIGTERM handler (graceful shutdown)
-- Health file updater
-
-### 2. Core Dialog Handler (src/core/dialog.rs)
-
-Processes all incoming events:
-- **Attention items** (questions, governance decisions): Render, enqueue to outbox
-- **User responses** (Telegram messages, callbacks): Validate, format, send to Paperclip
-- **Telegram updates**: Fetch with long polling (`getUpdates`), process
-
-### 3. Outbox and Delivery (src/core/sender.rs)
-
-Manages the delivery queue:
-- Dequeue pending messages
-- Retry with exponential backoff
-- Handle Telegram errors (rate limit, auth, etc.)
-- Update state on success
-
-### 4. SQLite Store (src/store/sqlite.rs)
-
-Stateful operations:
-- **insert_delivery**: Enqueue message
-- **update_delivery**: Mark as sent/failed
-- **recover**: On startup, reset in-flight → pending
-- **Idempotency**: Message ID prevents duplicates
-
-### 5. Paperclip Client (src/paperclip/http.rs)
-
-HTTP calls with error classification:
-- 401/403: Auth error (transient if retryable)
-- 409: Already resolved elsewhere (idempotent retry)
-- 5xx: Server error (retry with backoff)
-- 429: Rate limit (back off, then retry)
-
-## Common Tasks
-
-### Adding a New Paperclip API Endpoint
-
-1. Add the HTTP call to `src/paperclip/http.rs` (e.g., `async fn my_endpoint(...) -> Result<...>`)
-2. Add a trait method to `src/paperclip/mod.rs`
-3. Call it from the appropriate handler (dialog.rs, commands.rs)
-4. Add test in `tests/core_flow.rs`
-
-Example:
-```rust
-// src/paperclip/http.rs
-async fn fetch_run_logs(&self, run_id: &str) -> Result<String> {
-    let v = self.get(&["runs", run_id, "logs"], &[]).await?;
-    dto::run_logs(&v).ok_or(PaperclipError::Decode)
-}
-
-// src/paperclip/mod.rs
-#[async_trait]
-pub trait PaperclipApi: Send + Sync {
-    async fn fetch_run_logs(&self, run_id: &str) -> Result<String>;
-}
-```
-
-### Adding a New Bot Command
-
-1. Add command to `bot_commands()` in `src/core/commands.rs`
-2. Add handler logic (async function)
-3. Add match arm in `handle()`
-4. Test in `tests/core_flow.rs`
-
-Example:
-```rust
-pub fn bot_commands() -> Vec<BotCommand> {
-    [
-        ("status", "Status…"),
-        ("logs", "Show run logs"),  // New
-    ]…
-}
-
-pub async fn handle<P, T>(ctx: &Ctx<P, T>, name: &str) -> Result<Effects> {
-    Ok(match name {
-        "start" | "help" => …,
-        "logs" => Effects::message(show_logs(ctx).await?),  // New
-        …
-    })
-}
-```
-
-### Changing Configuration
-
-Edit `src/config.rs`:
-1. Add field to relevant struct (PaperclipConfig, TelegramConfig, etc.)
-2. Add parsing logic in `from_env()` (with default value)
-3. Update `.env.example` and README.md
-4. Add test in `tests/config_*.rs` (if applicable)
-
-## Performance Considerations
-
-- **Attention polling**: Limited to `ATTENTION_MAX_PAGES=10` to prevent runaway pagination
-- **Long polling timeout**: `TELEGRAM_LONG_POLL_TIMEOUT=25s` (Telegram max is 50s)
-- **Retry backoff**: Exponential, capped at 60s to prevent thundering herd
-- **Database**: WAL mode allows concurrent reads during writes; journal mode would stall
-
-## Debugging Idempotency Issues
-
-If a message is getting delivered twice:
-
-1. Check SQLite: `SELECT message_id, status FROM outbox WHERE issue_ref = '...';`
-2. Look at logs for Telegram 400 (conflict) vs 200 (success)
-3. Verify that `recover()` in `src/store/sqlite.rs` is running on startup
-4. Check if Telegram offset tracking is working (compare message IDs in logs)
-
-## Common Issues
-
-| Issue | Cause | Fix |
-|-------|-------|-----|
-| Config fails with "TELEGRAM_PROXY_URL is required" | Env var missing | Add to .env.local |
-| `cargo build` fails with "cannot find crate" | Dependency issue | `cargo update`, `cargo clean` |
-| Tests hang | Mocks not responding | Check `deploy/compose.yml` mock setup |
-| Logs don't show JSON | LOG_FORMAT env var | Set to `json` or `text` |
-| Health file never updates | `/state` permission issue | Check volume mount, uid 65532 |
-| Messages get duplicated | Outbox recovery issue | Check SQLite `recover()` logic; inspect WAL |
-
-## Next Steps
-
-- Read [TESTING.md](TESTING.md) to understand test coverage and run tests
-- Read [ARCHITECTURE.md](ARCHITECTURE.md) for system design and data flow
-- See [RUNBOOK.md](RUNBOOK.md) for operational procedures
+Вся работа ведётся в ветке `feat/bridge-v1` и одном PR; прямые push в `main` запрещены, merge делает только PET Lead. В коммитах и документах нет секретов, реальных адресов и имён инфраструктуры — только плейсхолдеры (`paperclip.internal`, `xray`, `123456789`).
