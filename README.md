@@ -4,7 +4,7 @@ A bridge service connecting Paperclip infrastructure to Telegram, enabling secur
 
 ## Overview
 
-This service acts as a middleware between Paperclip and Telegram, supporting both incoming and outgoing message flows with idempotent delivery, full encryption, and authentication. All traffic is routed through the Xray proxy — no direct connections to Telegram are possible.
+This service acts as a middleware between Paperclip and Telegram, supporting both incoming and outgoing message flows with idempotent delivery, strong encryption (TLS to Telegram via proxy, transport to Paperclip depends on `PAPERCLIP_URL`), and authentication. All traffic to Telegram is routed through the Xray proxy — no direct connections to Telegram are possible.
 
 **Key properties:**
 - **Idempotent**: duplicate requests produce one effect; answers are never lost or duplicated after restart
@@ -43,6 +43,7 @@ CONNECT_TIMEOUT=10s
 RETRY_BASE_DELAY=1s
 RETRY_MAX_DELAY=60s
 RETRY_MAX_ATTEMPTS=6
+RETRY_NOTIFY_AFTER=5                       # Attempt number to start sending notifications
 NOTIFY_RUN_FAILURES=true                   # Send notifications for run failures
 NOTIFY_TASK_COMPLETED=false                # Send when tasks complete
 NOTIFY_RESOLVED_ELSEWHERE=true             # Send when cards are resolved outside Telegram
@@ -55,6 +56,12 @@ SHUTDOWN_GRACE=10s                         # Grace period for graceful shutdown 
 LOG_LEVEL=info
 LOG_FORMAT=json
 ```
+
+**Governance settings** (approval workflows):
+- `GOVERNED_APPROVALS_ENABLED` (`true`): Enable governance card handling (destructive actions, confirmations)
+- `GOVERNED_DESTRUCTIVE_MODE` (`confirm` or `ui_only`): `confirm` requires 2-step approval in Telegram (ask → confirm); `ui_only` only displays decisions from Paperclip UI, no Telegram buttons for approval
+- `GOVERNED_SHOW_ARGUMENTS` (default `false`): Include function arguments in Telegram card preview (disabled by default to protect sensitive data)
+- `GOVERNED_RESULT_FOLLOW` (default `30m`): How long to poll Paperclip after user approves/rejects to confirm the decision was registered
 
 See [`.env.example`](.env.example) for a complete template.
 
@@ -97,15 +104,20 @@ The container exposes no ports: all network connections are outgoing (to Papercl
 
 1. Create a Telegram bot via [@BotFather](https://t.me/BotFather) with `/newbot`
 2. Extract the token (format: `123456789:ABCDEFGhIjklmnoPQRstUVWXYZabcDEf`)
-3. **Strongly recommended**: Enable 2-factor authentication in Telegram settings to protect the chat
-4. Add commands via `/setcommands`:
-   - `/status` — show current bridge and Paperclip state
-   - `/backlog` — list pending approvals and notifications
+3. **Strongly recommended**: Enable 2-factor authentication (Settings → Privacy and Security → Two-Step Verification) in Telegram to protect your account and prevent unauthorized agents from being triggered
+4. Bot commands are registered automatically by the bridge on startup:
+   - `/status` — show pending approvals and current Paperclip state
+   - `/backlog` — list top pending tasks by priority
+   - `/help` — display full help and usage guide
+   - `/cancel` — cancel text input
 
 To revoke the board key and issue a new one:
 ```bash
-docker exec bridge revoke-paperclip-key
-# Create new key in Paperclip UI, update the secret file, restart the bridge
+docker compose exec bridge /bridge revoke-paperclip-key
+# Then:
+# 1. Create a new board key in Paperclip UI (Admin → Board Keys)
+# 2. Update the secret file (PAPERCLIP_TOKEN_FILE) with the new token
+# 3. Restart the bridge: docker compose restart bridge
 ```
 
 ## Graceful Shutdown and stop_grace_period
@@ -142,8 +154,8 @@ State is stored in SQLite (`/state/bridge.db` and WAL files). To back up:
 # Stop the bridge
 docker compose down
 
-# Copy the state
-cp -r /path/to/bridge-state backup-$(date +%Y%m%d).tar.gz
+# Create tar archive (preserves permissions for uid 65532)
+tar -czf backup-$(date +%Y%m%d).tar.gz -C /path/to bridge-state/
 
 # Restart
 docker compose up
@@ -155,9 +167,12 @@ To restore from a backup:
 # Stop the bridge
 docker compose down
 
-# Restore the state
+# Clear existing state
 rm -rf /path/to/bridge-state/*
-tar -xzf backup-DATE.tar.gz -C /path/to/bridge-state/
+
+# Restore from archive
+tar -xzf backup-DATE.tar.gz -C /path/to/
+chown -R 65532:65532 /path/to/bridge-state
 
 # Restart
 docker compose up
@@ -170,24 +185,28 @@ On restart, the bridge automatically:
 
 ## Architecture and Design
 
-See [`docs/`](docs/) for detailed architecture, design decisions (ADRs), and test coverage:
+See [`docs/`](docs/) for detailed documentation:
 
-- `architecture.md` — system design, threat model, API contracts
+- `ARCHITECTURE.md` — system design, deployment patterns, and failure modes
+- `THREAT_MODEL.md` — security analysis (STRIDE) and residual risks
+- `DEVELOPMENT.md` — local development setup, debugging, and code organization
 - `TESTING.md` — test coverage matrix and how to run tests locally
-- `paperclip-api.md` — Paperclip API contract and error handling
+- `paperclip-api.md` — Paperclip API contract, required permissions, and error handling
+- `RUNBOOK.md` — operational procedures (key rotation, emergency recovery, monitoring)
+- `BACKUP_RESTORE.md` — detailed state backup and recovery procedures
+- `PAPERCLIP_PERMISSIONS.md` — list of required Paperclip API permissions
 - `adr/` — architectural decision records (ADR-0001 through ADR-0008)
 
 ## Known Limitations (v1)
 
-- **Deployment to user server not included**: This v1 release provides the bridge service and documentation. User deployment (setup, secrets, networks) is outside scope.
-- **Single Telegram account**: The bridge serves one chat in one Telegram account. Multiple accounts or group chats require separate bridge instances.
-- **Governance decisions are Telegram-only**: Decisions (approvals, confirmations) can only be made via Telegram buttons; the UI shows decisions as read-only.
-- **No message history sync**: Only new messages after startup are bridged; history is not synced from Telegram or Paperclip.
-- **Heartbeat file required**: Health check depends on `/state/health.json`. If `/state` is lost, health goes stale (but data recovers from DB).
+- **Deployment to user server not included**: This v1 release provides the bridge service and documentation. User deployment (infrastructure setup, secrets management, network configuration) is outside scope.
+- **Single Telegram account**: The bridge serves one chat in one Telegram account. Multiple independent bridges are required for multiple accounts or chats.
+- **No message history sync**: Only Paperclip attention items posted after bridge startup are bridged. Historical messages are not synced from either system.
+- **Heartbeat file required**: Health probe depends on `/state/health.json` timestamp. If volume `/state` is lost, health check goes stale; however, all messages recover from the SQLite database on restart.
 
 ## Development
 
-See [TESTING.md](docs/TESTING.md) for how to run tests locally and understand test coverage.
+Start with [DEVELOPMENT.md](docs/DEVELOPMENT.md) for local setup, then see [TESTING.md](docs/TESTING.md) for how to run tests and understand coverage.
 
 ## License
 
