@@ -91,10 +91,21 @@ async fn process<P: PaperclipApi, T: TelegramApi>(ctx: &Ctx<P, T>, e: OutboxEntr
                 ctx.learn_self_user_id(uid).await;
             }
             // Partial verdicts keep the card open (API §6.4).
-            if let (Resolution::Verdicts { .. }, Some(rec)) = (&resolution, &record)
-                && rec.status.is_pending()
-            {
-                return super::forms::verdicts_partial_done(ctx, &d, &e, rec).await;
+            if let Resolution::Verdicts { .. } = &resolution {
+                let current = match record {
+                    Some(rec) => Some(rec),
+                    // No record in the response: read the card to tell
+                    // partial from complete.
+                    None => ctx
+                        .paperclip
+                        .interactions(&d.issue_id)
+                        .await
+                        .ok()
+                        .and_then(|l| l.into_iter().find(|i| i.id == d.interaction_id)),
+                };
+                if let Some(rec) = current.filter(|r| r.status.is_pending()) {
+                    return super::forms::verdicts_partial_done(ctx, &d, &e, &rec).await;
+                }
             }
             succeed(ctx, &d, &e, &resolution).await
         }
