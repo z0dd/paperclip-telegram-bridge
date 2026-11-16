@@ -73,10 +73,12 @@ const MIGRATIONS: &[&str] = &[
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.busy_timeout(Duration::from_millis(5000))?;
+    // temp_store=MEMORY: the root filesystem is read-only, only /state is writable.
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = FULL;
-         PRAGMA foreign_keys = ON;",
+         PRAGMA foreign_keys = ON;
+         PRAGMA temp_store = MEMORY;",
     )?;
     let check: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
     if check != "ok" {
