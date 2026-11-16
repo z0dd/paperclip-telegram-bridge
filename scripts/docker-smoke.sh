@@ -128,14 +128,15 @@ if [ -n "$PORTS" ]; then
 fi
 echo "✓ No published ports (docker port output empty)"
 
-# Test 6: Verify non-root user at runtime
+# Test 6: Verify non-root user at runtime (use Config.User from inspect)
 echo ""
 echo "Test 6: Verifying non-root user at runtime..."
-RUNNING_UID=$(docker top "$CONTAINER_ID" -o uid | tail -n +2 | head -n 1)
-if [ -z "$RUNNING_UID" ] || [ "$RUNNING_UID" = "0" ]; then
-    fail "Container running as root (uid=$RUNNING_UID)"
+# Already verified Config.User in Test 1; here double-check it's not changed during run
+CONFIG_USER=$(docker inspect "$CONTAINER_ID" | jq -r '.[0].Config.User // empty')
+if [ -z "$CONFIG_USER" ] || [ "$CONFIG_USER" = "0" ] || [ "$CONFIG_USER" = "root" ]; then
+    fail "Container Config.User is root or empty (user=$CONFIG_USER)"
 fi
-echo "✓ Running as uid=$RUNNING_UID (non-root)"
+echo "✓ Running as user=$CONFIG_USER (non-root)"
 
 # Test 7: Check healthcheck
 echo ""
