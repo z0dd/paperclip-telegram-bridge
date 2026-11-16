@@ -39,7 +39,8 @@ echo "=== Docker Smoke Test ==="
 SECRETS_DIR=$(mktemp -d)
 echo "000000:TEST-DUMMY-TOKEN" > "$SECRETS_DIR/tg"
 echo "pcp_dummy" > "$SECRETS_DIR/pc"
-chmod 444 "$SECRETS_DIR"/*
+chmod 755 "$SECRETS_DIR"
+chmod 644 "$SECRETS_DIR"/*
 echo "Created dummy secrets in $SECRETS_DIR"
 
 # Create a named volume for /state
