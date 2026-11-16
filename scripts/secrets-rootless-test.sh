@@ -126,10 +126,14 @@ done
 echo ""
 echo "=== Test 4: Secret file permissions concepts ==="
 
+# Create test directory for permissions testing
+TESTFILE="$TEST_DIR/test_strict"
+mkdir -p "$TEST_DIR"
+
 # Test strict variant (0400)
-printf "placeholder-not-a-secret" > "$TEST_DIR/secrets/test_strict"
-chmod 0400 "$TEST_DIR/secrets/test_strict"
-FILE_MODE=$(stat -c %a "$TEST_DIR/secrets/test_strict" 2>/dev/null || echo "")
+printf "placeholder-not-a-secret" > "$TESTFILE"
+chmod 0400 "$TESTFILE"
+FILE_MODE=$(stat -c %a "$TESTFILE" 2>/dev/null || echo "")
 if [ "$FILE_MODE" = "400" ]; then
   echo "✓ Strict variant: 0400 set correctly"
 else
@@ -137,8 +141,9 @@ else
 fi
 
 # Test permissive variant (0644 requires explicit chmod, umask 077 gives 0600)
-( umask 077; printf "placeholder-not-a-secret" > "$TEST_DIR/secrets/test_perm" )
-FILE_MODE=$(stat -c %a "$TEST_DIR/secrets/test_perm" 2>/dev/null || echo "")
+TESTFILE2="$TEST_DIR/test_perm"
+( umask 077; printf "placeholder-not-a-secret" > "$TESTFILE2" )
+FILE_MODE=$(stat -c %a "$TESTFILE2" 2>/dev/null || echo "")
 if [ "$FILE_MODE" = "600" ]; then
   echo "✓ Permissive variant: umask 077 creates 0600 (need explicit chmod 0644 for 0644)"
 else
