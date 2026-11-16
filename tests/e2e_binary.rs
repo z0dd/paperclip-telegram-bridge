@@ -268,3 +268,83 @@ async fn set_my_commands_registers_the_command_list_via_proxy() {
         "setMyCommands must use the proxy"
     );
 }
+
+/// Starts the binary with `/api/health` answering `health`, waits for the
+/// first Telegram poll and returns the log.
+async fn start_with_health(health: serde_json::Value) -> String {
+    let env = Env::new().await;
+    serve(&env.paperclip, &[], vec![]).await;
+    Mock::given(method("GET"))
+        .and(path("/api/health"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(health))
+        .mount(&env.paperclip)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/bot{TOKEN}/getUpdates")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": true, "result": []}))
+                .set_delay(Duration::from_secs(20)),
+        )
+        .mount(&env.telegram)
+        .await;
+    let mut child = env.spawn();
+    let t0 = Instant::now();
+    while !env
+        .telegram
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.url.path().ends_with("/getUpdates"))
+    {
+        assert!(t0.elapsed() < Duration::from_secs(10), "start was blocked");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    sigterm(&child);
+    let status = wait_exit(&mut child, Duration::from_secs(8)).await;
+    let log = stderr(&mut child);
+    assert!(status.success(), "exit status {status:?}\n{log}");
+    log
+}
+
+fn warn_line<'a>(log: &'a str, message: &str) -> &'a str {
+    log.lines()
+        .find(|l| l.contains(message))
+        .unwrap_or_else(|| panic!("no {message:?} in\n{log}"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn other_paperclip_version_warns_and_starts() {
+    let log = start_with_health(json!({"status": "ok", "version": "2026.0101.0"})).await;
+    let line = warn_line(&log, "paperclip version differs from the tested one");
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("2026.0101.0"), "{line}");
+    assert!(
+        line.contains(bridge::paperclip::version::TESTED_PAPERCLIP_VERSION),
+        "{line}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_paperclip_version_warns_and_starts() {
+    let log = start_with_health(json!({"status": "ok"})).await;
+    let line = warn_line(&log, "paperclip version is missing");
+    assert!(line.contains("WARN"), "{line}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unrecognized_paperclip_version_warns_and_starts() {
+    let log = start_with_health(json!({"status": "ok", "version": "x"})).await;
+    let line = warn_line(&log, "paperclip version is not recognized");
+    assert!(line.contains("WARN"), "{line}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tested_paperclip_version_is_info_only() {
+    let version = bridge::paperclip::version::TESTED_PAPERCLIP_VERSION;
+    let log = start_with_health(json!({"status": "ok", "version": version})).await;
+    let line = warn_line(&log, "paperclip reachable");
+    assert!(line.contains("INFO"), "{line}");
+    assert!(!log.contains("paperclip version"), "{log}");
+}

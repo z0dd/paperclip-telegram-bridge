@@ -43,6 +43,8 @@ pub struct FakeTelegram {
     pub calls: Mutex<Vec<TgCall>>,
     next_id: AtomicI64,
     pub fail_sends: AtomicBool,
+    /// `editMessageText` answers `400 message to edit not found`.
+    pub fail_edits: AtomicBool,
 }
 
 impl FakeTelegram {
@@ -152,6 +154,9 @@ impl TelegramApi for FakeTelegram {
         html: &str,
         keyboard: Option<&InlineKeyboard>,
     ) -> Result<()> {
+        if self.fail_edits.load(Ordering::SeqCst) {
+            return Err(TelegramError::MessageNotFound);
+        }
         self.calls.lock().unwrap().push(TgCall::Edit {
             id,
             html: html.to_string(),
@@ -368,6 +373,12 @@ impl Harness {
     }
 
     pub async fn text(&self, text: &str, reply_to: Option<i64>) -> Update {
+        let u = self.text_update(text, reply_to);
+        self.send_update(u).await
+    }
+
+    /// A text message update (allowed sender and chat), not sent yet.
+    pub fn text_update(&self, text: &str, reply_to: Option<i64>) -> Value {
         let mut msg = json!({"message_id": 9000 + self.next_update.load(Ordering::SeqCst),
             "from": {"id": USER, "is_bot": false, "first_name": "u"},
             "chat": {"id": CHAT, "type": "private"}, "date": 0, "text": text});
@@ -375,8 +386,7 @@ impl Harness {
             msg["reply_to_message"] =
                 json!({"message_id": r, "chat": {"id": CHAT, "type": "private"}, "date": 0});
         }
-        let u = json!({"update_id": self.update_id(), "message": msg});
-        self.send_update(u).await
+        json!({"update_id": self.update_id(), "message": msg})
     }
 
     /// Current text of the card (last message) and its keyboard.

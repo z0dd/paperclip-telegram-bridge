@@ -256,10 +256,10 @@ async fn own_answer_and_text_reply() {
     );
     h.press_button("q-1", "Отправить").await;
 
-    // Text answer as a reply to the card message itself.
+    // Text answer as a reply to the card message itself: queued at once,
+    // without a confirmation (ADR-0009 §1).
     let card_msg = h.delivery("q-2").await.last_message_id().unwrap();
     h.text("free text answer", Some(card_msg)).await;
-    h.press_button("q-2", "Отправить").await;
     h.outbox().await;
     let bodies = posts(&server, "/respond").await;
     assert!(bodies.contains(&json!({"answers": [{"questionId": "pick", "optionIds": [], "otherText": "my own"}], "summaryMarkdown": null})));

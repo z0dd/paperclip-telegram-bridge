@@ -2,6 +2,7 @@
 
 pub mod dto;
 pub mod http;
+pub mod version;
 
 use std::future::Future;
 use std::time::Duration;

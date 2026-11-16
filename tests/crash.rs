@@ -116,3 +116,100 @@ async fn crash_before_commit_of_update_loses_nothing() {
     assert_eq!(posts(&server, "/accept").await.len(), 1);
     assert_eq!(h.delivery("card-1").await.status, DeliveryStatus::Answered);
 }
+
+fn text_card() -> serde_json::Value {
+    card(
+        "q-1",
+        "ask_user_questions",
+        "pending",
+        json!({"version": 1, "questionSet": {"questions": [
+            {"id": "notes", "prompt": "Notes?", "required": true, "answerMode": "text"}]}}),
+    )
+}
+
+#[tokio::test]
+async fn chat_text_answer_survives_a_restart_and_is_sent_once() {
+    // ADR-0009 §1, row 18: the answer is durable once the update is committed.
+    let _guard = SERIAL.lock().await;
+    let server = MockServer::start().await;
+    serve(&server, &["q-1"], vec![text_card()]).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let h = Harness::start(&server.uri(), &[]).await;
+    h.sync().await;
+    h.text("survives", None).await;
+    assert_eq!(h.delivery("q-1").await.status, DeliveryStatus::Answering);
+    let queued = h.tg.texts().len();
+
+    // Process dies before the outbox ran.
+    let h = h.restart().await;
+    bridge::core::forms::announce_restart(&h.ctx).await.unwrap();
+    h.outbox().await;
+    assert_eq!(
+        posts(&server, "/respond").await,
+        vec![
+            json!({"answers": [{"questionId": "notes", "optionIds": [], "otherText": "survives"}],
+                    "summaryMarkdown": null})
+        ]
+    );
+    assert_eq!(h.delivery("q-1").await.status, DeliveryStatus::Answered);
+    // No second "accepted" status after the restart.
+    assert!(
+        h.tg.texts()[queued..]
+            .iter()
+            .all(|t| !t.contains("принят и поставлен"))
+    );
+}
+
+#[tokio::test]
+async fn chat_text_crash_after_http_reconciles_without_a_second_answer() {
+    let _guard = SERIAL.lock().await;
+    let server = MockServer::start().await;
+    serve(&server, &["q-1"], vec![text_card()]).await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/issues/{ISSUE}/interactions/q-1/respond"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let h = Harness::start(&server.uri(), &[]).await;
+    h.sync().await;
+    let msg = h.delivery("q-1").await.last_message_id().unwrap();
+    h.text("in flight", Some(msg)).await;
+    fault::arm(fault::AFTER_HTTP_BEFORE_OUTBOX_COMMIT);
+    assert!(h.try_outbox().await.is_err(), "crash injected");
+
+    serve(
+        &server,
+        &[],
+        vec![resolved(
+            text_card(),
+            "answered",
+            Some("user-1"),
+            None,
+            json!({"version": 1, "answers": [{"questionId": "notes", "optionIds": [], "otherText": "in flight"}]}),
+        )],
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/issues/{ISSUE}/interactions/q-1/respond"
+        )))
+        .respond_with(
+            ResponseTemplate::new(409).set_body_json(
+                json!({"error": "resolved", "code": "interaction_already_resolved"}),
+            ),
+        )
+        .mount(&server)
+        .await;
+    let h = h.restart().await;
+    h.outbox().await;
+    assert_eq!(h.delivery("q-1").await.status, DeliveryStatus::Answered);
+    // Exactly one POST after the restart, answered by 409 and reconciled.
+    assert_eq!(posts(&server, "/respond").await.len(), 1);
+    assert_eq!(h.ctx.store.pending_outbox_count().await.unwrap(), 0);
+}

@@ -203,6 +203,13 @@ pub struct Recovery {
     pub sending: Vec<i64>,
 }
 
+/// A one-question text card whose v1.0.0 draft was dropped (ADR-0009 §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetDraft {
+    pub delivery_id: i64,
+    pub issue_ref: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitOutcome {
     Applied,
@@ -268,6 +275,13 @@ impl Store {
 
     pub async fn recover(&self) -> Result<Recovery> {
         self.call(sqlite::recover).await
+    }
+
+    /// Drops drafts of one-question text cards (whatever the delivery status)
+    /// and bumps their generation, in one transaction. Nothing is queued and
+    /// the draft text is not read. Returns the `sent` cards to re-render.
+    pub async fn reset_chat_text_drafts(&self) -> Result<Vec<ResetDraft>> {
+        self.call(sqlite::reset_chat_text_drafts).await
     }
 
     pub async fn get_meta(&self, key: &'static str) -> Result<Option<String>> {

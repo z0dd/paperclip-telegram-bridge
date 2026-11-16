@@ -143,6 +143,17 @@ pub struct QuestionForm {
     pub questions: Vec<Question>,
 }
 
+impl QuestionForm {
+    /// The only question of a one-question free-text form: it is answered by
+    /// a plain chat message (ADR-0009 §1, Р1).
+    pub fn single_text(&self) -> Option<&Question> {
+        match self.questions.as_slice() {
+            [q] if q.mode == AnswerMode::Text => Some(q),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Question {
     pub id: String,
