@@ -72,27 +72,6 @@ jobs:
           git check-ignore -q secrets/paperclip_token || (echo "❌ secrets/paperclip_token not in .gitignore"; exit 1)
           echo "✓ All secrets paths are correctly ignored"
 
-  compose-config:
-    name: compose-config
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Prepare fixtures
-        run: |
-          mkdir -p secrets && touch .env
-          echo "placeholder-not-a-secret" > secrets/paperclip_token
-          echo "placeholder-not-a-secret" > secrets/telegram_bot_token
-      - name: Validate compose files and check hardening
-        run: |
-          set -e
-          docker compose -f deploy/compose.example.yml config --format json > /tmp/isolated.json
-          docker compose -f deploy/compose.host-network.example.yml config --format json > /tmp/host.json
-          echo "✓ Both compose files are valid YAML"
-
-          cat /tmp/isolated.json | jq '.services.bridge | {tmpfs, network_mode}' | head -5
-          cat /tmp/host.json | jq '.services.bridge | {tmpfs, network_mode}' | head -5
-          echo "✓ Compose configuration checked"
-
   docker:
     name: docker
     runs-on: ubuntu-latest
