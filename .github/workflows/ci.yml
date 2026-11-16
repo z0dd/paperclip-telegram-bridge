@@ -61,6 +61,80 @@ jobs:
           log-level: warn
           command: check all
 
+  gitignore:
+    name: gitignore-secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check that secrets paths are gitignored
+        run: |
+          git check-ignore -q secrets/telegram_bot_token || (echo "❌ secrets/telegram_bot_token not in .gitignore"; exit 1)
+          git check-ignore -q secrets/paperclip_token || (echo "❌ secrets/paperclip_token not in .gitignore"; exit 1)
+          echo "✓ All secrets paths are correctly ignored"
+
+  compose-config:
+    name: compose-config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Create placeholder files
+        run: |
+          mkdir -p secrets .env-placeholder
+          echo "placeholder-not-a-secret" > secrets/paperclip_token
+          echo "placeholder-not-a-secret" > secrets/telegram_bot_token
+          touch .env
+      - name: Validate both compose files
+        run: |
+          docker compose -f deploy/compose.example.yml config --format json > /tmp/isolated.json
+          docker compose -f deploy/compose.host-network.example.yml config --format json > /tmp/host.json
+          echo "✓ Both compose files validate"
+      - name: Compare hardening
+        run: |
+          ISOLATED=$(docker compose -f deploy/compose.example.yml config --format json | jq '.services.bridge | {restart, read_only, user, cap_drop, security_opt, tmpfs, stop_grace_period}')
+          HOST=$(docker compose -f deploy/compose.host-network.example.yml config --format json | jq '.services.bridge | {restart, read_only, user, cap_drop, security_opt, tmpfs, stop_grace_period}')
+          if [ "$ISOLATED" != "$HOST" ]; then
+            echo "❌ Hardening differs between compose files"
+            echo "Isolated: $ISOLATED"
+            echo "Host:     $HOST"
+            exit 1
+          fi
+          echo "✓ Hardening identical"
+      - name: Verify tmpfs in both files
+        run: |
+          if ! docker compose -f deploy/compose.example.yml config --format json | jq '.services.bridge.tmpfs[]' | grep -q "/tmp"; then
+            echo "❌ tmpfs /tmp not in compose.example.yml"
+            exit 1
+          fi
+          if ! docker compose -f deploy/compose.host-network.example.yml config --format json | jq '.services.bridge.tmpfs[]' | grep -q "/tmp"; then
+            echo "❌ tmpfs /tmp not in compose.host-network.example.yml"
+            exit 1
+          fi
+          echo "✓ tmpfs /tmp in both files"
+      - name: Verify host-network config
+        run: |
+          CONFIG=$(docker compose -f deploy/compose.host-network.example.yml config --format json)
+          if [ "$(echo "$CONFIG" | jq -r '.services.bridge.network_mode')" != "host" ]; then
+            echo "❌ network_mode should be 'host'"
+            exit 1
+          fi
+          if echo "$CONFIG" | jq '.services.bridge | has("networks")' | grep -q true; then
+            echo "❌ networks should not be defined"
+            exit 1
+          fi
+          if echo "$CONFIG" | jq '.services.bridge | has("ports")' | grep -q true; then
+            echo "❌ ports should not be defined"
+            exit 1
+          fi
+          echo "✓ Host-network config correct"
+
+  rootless-secrets:
+    name: rootless-secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run rootless Docker secrets test
+        run: bash scripts/secrets-rootless-test.sh
+
   docker:
     name: docker
     runs-on: ubuntu-latest

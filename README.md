@@ -54,7 +54,32 @@ docker compose up -d
 docker compose ps                              # статус healthy появится после start-period (30 с)
 ```
 
-Секреты читаются **только из файлов** (`PAPERCLIP_TOKEN_FILE`, `TELEGRAM_BOT_TOKEN_FILE`); переменных с самими токенами нет намеренно. Не коммитьте `.env` и `secrets/`: они в `.gitignore` (`.env`, `*.key`), но каталог `secrets/` туда не входит, следите сами.
+Секреты читаются **только из файлов** (`PAPERCLIP_TOKEN_FILE`, `TELEGRAM_BOT_TOKEN_FILE`); переменных с самими токенами нет намеренно. **Каталог `secrets/` обязательно в `.gitignore`**: проверяет CI.
+
+#### Хранение секретов (rootless Docker)
+
+В rootless Docker рекомендуется **строгий вариант** прав:
+
+```sh
+install -d -m 0700 secrets
+( umask 077; printf '%s' '<telegram bot token>' > secrets/telegram_bot_token )
+( umask 077; printf '%s' '<paperclip token>'     > secrets/paperclip_token )
+docker run --rm --network none -v "$PWD/secrets:/s" busybox:1.37 \
+  sh -c 'chown 65532:65532 /s/telegram_bot_token /s/paperclip_token && chmod 0400 /s/telegram_bot_token /s/paperclip_token'
+```
+
+Контейнер в составе bridge запускается с UID 65532. Файлы `0400` собственные этому UID, хост-пользователь их не читает (это дополнительная защита). **Ротация:** удалить файл, записать новый, повторить рецепт.
+
+**Допустимый вариант** (проще, менее строго): `chmod 0644` для файлов в каталоге `0700` хост-пользователя:
+
+```sh
+install -d -m 0700 secrets
+( umask 077; printf '%s' '<telegram bot token>' > secrets/telegram_bot_token )
+( umask 077; printf '%s' '<paperclip token>'     > secrets/paperclip_token )
+# Больше ничего не делать, права `0644` уже установлены через umask
+```
+
+**Не используйте:** `chmod 0400`, `0600`, `0640` для файла хост-пользователя — они не работают в rootless Docker. Rootful Docker не проверялся.
 
 В `deploy/compose.example.yml` контейнер запускается с `read_only: true`, `user: 65532:65532`, `cap_drop: [ALL]`, `no-new-privileges`, без `ports:`, с именованным томом `bridge-state` на `/state`, и подключается только к внешним сетям `paperclip_internal` и `xray_egress` (имена-плейсхолдеры, замените на свои). Сети без маршрута в интернет — дополнительная защита от прямого выхода.
 
