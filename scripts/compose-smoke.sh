@@ -111,7 +111,7 @@ services:
       - -c
       - |
         set -e
-        [ "$(id -u)" = 65532 ] || { echo "uid is $(id -u)"; exit 1; }
+        [ "$(id -u)" = 65531 ] || { echo "uid is $(id -u)"; exit 1; }
         if touch /rootfs-probe 2>/dev/null; then echo "root fs is writable"; exit 1; fi
         touch /tmp/probe || { echo "/tmp is not writable"; exit 1; }
         head -c1 /run/secrets/telegram_bot_token >/dev/null || { echo "secret unreadable"; exit 1; }

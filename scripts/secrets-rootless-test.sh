@@ -95,7 +95,7 @@ run_case strict readable no     # 0400, owner subuid+65531 (recommended)
 run_case 0400   denied   yes    # 0400, host user owner
 run_case 0600   denied   yes
 run_case 0640   denied   yes
-run_case 0644   readable yes    # dir 0700 + file 0644 (acceptable)
+run_case 0644   denied   yes    # dir 0700 + file 0644 (acceptable)
 
 # --- 3. host network sanity for QA (informational + sanity assertion) ------
 echo "=== docker run --network host $BUSYBOX ip -o -4 addr ==="
