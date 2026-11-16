@@ -134,6 +134,8 @@ impl std::io::Write for Capture {
 
 #[tokio::test]
 async fn token_is_not_in_errors_or_logs_on_connection_failure() {
+    // Global subscriber: a thread-local one misses events once another test
+    // thread cached the callsite interest.
     let capture = Capture::default();
     let writer = capture.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -141,7 +143,7 @@ async fn token_is_not_in_errors_or_logs_on_connection_failure() {
         .with_max_level(tracing::Level::DEBUG)
         .with_writer(move || writer.clone())
         .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::subscriber::set_global_default(subscriber).unwrap();
 
     let proxy = format!("socks5h://user:hunter2@127.0.0.1:{}", closed_port());
     let client =
@@ -154,6 +156,10 @@ async fn token_is_not_in_errors_or_logs_on_connection_failure() {
     tracing::warn!(error = %err, class = err.class(), "telegram call failed");
     let rendered = format!("{err} {err:?}");
     let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("telegram call failed"),
+        "log was captured: {logs}"
+    );
     for haystack in [&rendered, &logs] {
         assert!(!haystack.contains("TEST-placeholder-token"), "{haystack}");
         assert!(!haystack.contains("hunter2"), "{haystack}");
