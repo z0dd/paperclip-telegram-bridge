@@ -28,6 +28,30 @@ pub struct Effects {
     /// Plain messages to send.
     pub messages: Vec<String>,
     pub enqueued: bool,
+    /// Decision journal entry, logged after the commit with the update id.
+    pub decision: Option<Decision>,
+}
+
+/// What the user decided, without any content (architecture §10, measure 4).
+#[derive(Debug, Clone)]
+pub struct Decision {
+    pub delivery_id: i64,
+    pub interaction_id: String,
+    pub kind: String,
+    pub risk: Option<&'static str>,
+    pub action: &'static str,
+}
+
+fn risk_of(d: &Delivery) -> Option<&'static str> {
+    match &d.snapshot.interaction.body {
+        InteractionBody::ToolAction(t) => Some(match t.risk {
+            Risk::Read => "read",
+            Risk::Write => "write",
+            Risk::Destructive => "destructive",
+        }),
+        InteractionBody::SecretProposal(_) => Some("secret_binding"),
+        _ => None,
+    }
 }
 
 impl Effects {
@@ -71,7 +95,15 @@ impl Effects {
 
     /// Queues the answer for Paperclip.
     pub fn enqueue(d: &Delivery, resolution: Resolution, answer: &str) -> Self {
+        let decision = Some(Decision {
+            delivery_id: d.id,
+            interaction_id: d.interaction_id.clone(),
+            kind: d.kind.clone(),
+            risk: risk_of(d),
+            action: resolution.action_name(),
+        });
         Self {
+            decision,
             ops: vec![
                 StoreOp::Enqueue {
                     delivery_id: d.id,
@@ -124,11 +156,23 @@ pub async fn handle_update<P: PaperclipApi, T: TelegramApi>(
         prompt,
         messages,
         enqueued,
+        decision,
     } = effects;
     let outcome = ctx.store.commit_update(update.update_id, ops).await?;
     if outcome == CommitOutcome::Duplicate {
         tracing::debug!(update_id = update.update_id, "duplicate update skipped");
         return Ok(());
+    }
+    if let Some(dec) = decision {
+        tracing::info!(
+            update_id = update.update_id,
+            delivery_id = dec.delivery_id,
+            interaction_id = %dec.interaction_id,
+            kind = %dec.kind,
+            risk = dec.risk.unwrap_or("-"),
+            action = dec.action,
+            "decision from telegram queued"
+        );
     }
     // Side effects after the commit. Failures here are not fatal: the state is
     // already consistent and the next render repairs the message.
@@ -171,7 +215,7 @@ async fn on_callback<P: PaperclipApi, T: TelegramApi>(
         return Ok(Effects::stale(&d));
     }
     let draft = ctx.store.draft(d.id).await?;
-    let effects = match &d.snapshot.interaction.body {
+    Ok(match &d.snapshot.interaction.body {
         InteractionBody::Confirmation(c) => confirmation_callback(&d, c, draft, cb),
         InteractionBody::Checkbox(c) => checkbox_callback(&d, c, draft, cb),
         InteractionBody::Questions(f) => forms::questions_callback(&d, f, draft, cb),
@@ -180,17 +224,7 @@ async fn on_callback<P: PaperclipApi, T: TelegramApi>(
             governed::callback(ctx, &d, draft, cb).await
         }
         InteractionBody::Unsupported { .. } => Effects::stale(&d),
-    };
-    if effects.enqueued {
-        tracing::info!(
-            delivery_id = d.id,
-            interaction_id = %d.interaction_id,
-            kind = %d.kind,
-            update_source = "callback",
-            "answer queued"
-        );
-    }
-    Ok(effects)
+    })
 }
 
 /// Rejection with an optional or required reason (confirmation, checkbox).
@@ -385,17 +419,7 @@ async fn on_message<P: PaperclipApi, T: TelegramApi>(
             crate::render::escape(&d.issue_ref)
         )));
     }
-    let effects = on_text(ctx, &d, draft, trimmed, via_reply).await;
-    if effects.enqueued {
-        tracing::info!(
-            delivery_id = d.id,
-            interaction_id = %d.interaction_id,
-            kind = %d.kind,
-            update_source = "message",
-            "answer queued"
-        );
-    }
-    Ok(effects)
+    Ok(on_text(ctx, &d, draft, trimmed, via_reply).await)
 }
 
 async fn on_text<P: PaperclipApi, T: TelegramApi>(
