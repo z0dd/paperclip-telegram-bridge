@@ -30,7 +30,8 @@ cp -f "$tmp"/docker/* "$tmp"/docker-rootless-extras/* "$HOME/bin/"
 export PATH="$HOME/bin:$PATH"
 
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-dockerd-rootless-setuptool.sh install --skip-iptables
+# --force: the runner has a rootful daemon; the rootless one runs next to it.
+dockerd-rootless-setuptool.sh install --force --skip-iptables
 
 export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/docker.sock"
 for _ in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
