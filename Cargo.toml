@@ -1,0 +1,53 @@
+[package]
+name = "paperclip-telegram-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.100"
+description = "Bridge service connecting Paperclip to Telegram"
+repository = "https://github.com/z0dd/paperclip-telegram-bridge"
+
+[[bin]]
+name = "bridge"
+path = "src/main.rs"
+
+[lib]
+name = "bridge"
+path = "src/lib.rs"
+
+[features]
+# Crash-injection hooks for recovery tests. Never enabled in release builds.
+fault-injection = []
+
+[dependencies]
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net", "io-util"] }
+tokio-util = "0.7"
+# rustls with the `ring` provider only: no aws-lc-sys (OpenSSL licence, cmake), no system proxy discovery.
+reqwest = { version = "0.13", default-features = false, features = ["json", "socks", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "fmt", "std", "ansi"] }
+secrecy = "0.10"
+rand = "0.10"
+url = "2.5"
+humantime = "2.4"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+sha2 = "0.11"
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+assert_cmd = "2"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
