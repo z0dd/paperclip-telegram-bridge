@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 
 use bridge::config::{Config, Env, HealthConfig};
-use bridge::{health, logging, shutdown, timeutil};
+use bridge::{app, health, logging, shutdown, timeutil};
 use tokio_util::sync::CancellationToken;
 
 const USAGE: &str = "usage: bridge [run|check-config|healthcheck]";
@@ -95,22 +95,19 @@ fn run() -> ExitCode {
             tracing::error!(error = %e, "cannot install signal handlers");
             return ExitCode::FAILURE;
         }
-        let tracker = std::sync::Arc::new(health::HealthTracker::new());
         tracing::info!(
             companies = cfg.paperclip.company_ids.len(),
             proxy_scheme = cfg.telegram.proxy.scheme(),
+            governed_enabled = cfg.governed.enabled,
+            destructive_mode = ?cfg.governed.destructive_mode,
             "bridge starting"
         );
-        loop {
-            if let Err(e) = health::write_file(&cfg.health.file, &tracker.snapshot()) {
-                tracing::warn!(error_kind = ?e.kind(), "cannot write health file");
-            }
-            tokio::select! {
-                _ = token.cancelled() => break,
-                _ = tokio::time::sleep(health::WRITE_INTERVAL) => {}
+        match app::run(cfg, token).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::error!(error = %e, "bridge failed");
+                ExitCode::FAILURE
             }
         }
-        tracing::info!("bridge stopped");
-        ExitCode::SUCCESS
     })
 }

@@ -1,6 +1,7 @@
 //! paperclip-telegram-bridge: delivers pending Paperclip interactions to one
 //! Telegram user and sends the answers back.
 
+pub mod app;
 pub mod config;
 pub mod core;
 pub mod domain;
