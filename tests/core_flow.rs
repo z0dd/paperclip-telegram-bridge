@@ -338,7 +338,12 @@ async fn reject_with_required_reason_waits_for_text() {
     let h = Harness::start(&server.uri(), &[]).await;
     h.sync().await;
     h.text("random text", None).await;
-    assert!(h.tg.texts().last().unwrap().contains("Не жду текста"));
+    assert!(
+        h.tg.texts()
+            .last()
+            .unwrap()
+            .contains("Сейчас нет вопросов, на которые можно ответить текстом")
+    );
     h.press_button("card-1", "Reject").await;
     let prompts = h.tg.prompts();
     assert_eq!(prompts.len(), 1);

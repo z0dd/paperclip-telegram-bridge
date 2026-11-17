@@ -8,7 +8,7 @@ use crate::domain::*;
 use crate::paperclip::PaperclipApi;
 use crate::render::forms::{answer_at, chosen_verdict};
 use crate::render::{Callback, Op, escape};
-use crate::store::{Delivery, DeliveryStatus, OutboxEntry, StoreOp};
+use crate::store::{Delivery, DeliveryStatus, OutboxEntry, ResetDraft, StoreOp};
 use crate::telegram::TelegramApi;
 use crate::timeutil;
 
@@ -64,12 +64,50 @@ fn reset_draft(d: &Delivery) -> Effects {
     }
 }
 
+/// An open card answered by a plain chat message (ADR-0009 §1, Р1).
+pub fn is_chat_text_question(d: &Delivery) -> bool {
+    d.status == DeliveryStatus::Sent
+        && matches!(&d.snapshot.interaction.body,
+            InteractionBody::Questions(f) if f.single_text().is_some())
+}
+
+/// Direct path for a chat text answer: validate, then queue at once without
+/// a draft, preview or confirmation.
+pub fn chat_text_answer(d: &Delivery, f: &QuestionForm, text: &str) -> Effects {
+    let Some(q) = f.single_text() else {
+        return Effects::message(super::dialog::NOT_WAITING);
+    };
+    if let Err(reason) = validate_text(q, text) {
+        return Effects::message(format!(
+            "{}. Вопрос остаётся открытым — отправьте ответ ещё раз.",
+            escape(reason.trim_end_matches('.'))
+        ));
+    }
+    let answers = vec![QuestionAnswer {
+        question_id: q.id.clone(),
+        option_ids: Vec::new(),
+        other_text: Some(text.to_string()),
+    }];
+    let mut e = Effects::enqueue(d, Resolution::Respond { answers }, "");
+    e.answer = None;
+    e.ops.push(StoreOp::DeleteDraft(d.id));
+    e.messages.push(format!(
+        "📨 Ответ на {} принят и поставлен в очередь отправки.",
+        escape(&d.issue_ref)
+    ));
+    e
+}
+
 pub fn questions_callback(
     d: &Delivery,
     f: &QuestionForm,
     draft: Option<Draft>,
     cb: Callback,
 ) -> Effects {
+    // A chat-text card has no buttons: anything pressed is an old keyboard.
+    if f.single_text().is_some() {
+        return Effects::stale(d);
+    }
     let n = f.questions.len();
     let step = draft.as_ref().map_or(0, |x| x.step).min(n);
     let q_idx = cb.a.map(|a| a as usize);
@@ -475,6 +513,33 @@ pub async fn verdicts_partial_done<P: PaperclipApi, T: TelegramApi>(
     )
     .await;
     cards::refresh(ctx, d.id).await
+}
+
+/// After the v1.1.0 draft migration (ADR-0009 §2): re-renders each card whose
+/// draft was dropped and tells the user the text was not sent. Failures are
+/// logged and never stop the start.
+pub async fn announce_chat_text_reset<P: PaperclipApi, T: TelegramApi>(
+    ctx: &Ctx<P, T>,
+    reset: &[ResetDraft],
+) {
+    for r in reset {
+        if let Err(e) = cards::refresh(ctx, r.delivery_id).await {
+            tracing::warn!(delivery_id = r.delivery_id, error = %e, "card refresh after draft reset failed");
+        }
+        if let Err(e) = ctx
+            .tg
+            .send(
+                format!(
+                    "🔄 Bridge обновлён: черновик ответа на {} сброшен, текст не отправлен. Ответьте на вопрос обычным сообщением.",
+                    escape(&r.issue_ref)
+                ),
+                None,
+            )
+            .await
+        {
+            tracing::warn!(delivery_id = r.delivery_id, class = e.class(), "cannot send draft reset notice");
+        }
+    }
 }
 
 /// After a restart: one message per unfinished draft, then the card again

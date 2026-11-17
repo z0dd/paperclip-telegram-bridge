@@ -10,9 +10,9 @@ use crate::config::Config;
 use crate::core::sender::{self, SenderSettings, TgSender};
 use crate::core::{Bridge, Ctx, commands, forms, outbox, poller, runs, sync};
 use crate::health::{self, HealthTracker};
-use crate::paperclip::{HttpPaperclipClient, PaperclipApi};
+use crate::paperclip::{HttpPaperclipClient, PaperclipApi, version};
 use crate::retry::Backoff;
-use crate::store::Store;
+use crate::store::{ResetDraft, Store};
 use crate::telegram::{HttpTelegramClient, TelegramApi};
 
 /// Telegram allows about one message per second in a private chat.
@@ -30,13 +30,18 @@ pub async fn run(cfg: Config, token: CancellationToken) -> Result<(), String> {
         redeliver = rec.sending.len(),
         "state opened"
     );
+    // ADR-0009 §2: before anything reads drafts (restart notice included).
+    let reset = store
+        .reset_chat_text_drafts()
+        .await
+        .map_err(|e| format!("draft migration failed: {e}"))?;
+    if !reset.is_empty() {
+        tracing::info!(cards = reset.len(), "chat text drafts reset");
+    }
     let paperclip = Arc::new(HttpPaperclipClient::from_config(&cfg.paperclip)?);
     let telegram = Arc::new(HttpTelegramClient::new(&cfg.telegram)?);
     match paperclip.health().await {
-        Ok(h) => tracing::info!(
-            paperclip_version = h.version.as_deref().unwrap_or("unknown"),
-            "paperclip reachable"
-        ),
+        Ok(h) => version::log_check(h.version.as_deref()),
         Err(e) => tracing::warn!(class = %e.class(), "paperclip health check failed, continuing"),
     }
     let (tg, rx) = TgSender::channel();
@@ -69,7 +74,7 @@ pub async fn run(cfg: Config, token: CancellationToken) -> Result<(), String> {
     ));
 
     let tasks = spawn_tasks(&ctx, &token);
-    tokio::spawn(startup_messages(ctx.clone()));
+    tokio::spawn(startup_messages(ctx.clone(), reset));
 
     token.cancelled().await;
     tracing::info!(grace_s = cfg.shutdown_grace.as_secs(), "stopping");
@@ -132,10 +137,11 @@ async fn health_writer<P: PaperclipApi, T: TelegramApi>(ctx: Ctx<P, T>, token: C
     }
 }
 
-async fn startup_messages<P: PaperclipApi, T: TelegramApi>(ctx: Ctx<P, T>) {
+async fn startup_messages<P: PaperclipApi, T: TelegramApi>(ctx: Ctx<P, T>, reset: Vec<ResetDraft>) {
     if let Err(e) = ctx.tg.set_commands(commands::bot_commands()).await {
         tracing::warn!(class = e.class(), "setMyCommands failed");
     }
+    forms::announce_chat_text_reset(&ctx, &reset).await;
     if let Err(e) = forms::announce_restart(&ctx).await {
         tracing::warn!(error = %e, "cannot announce unfinished forms");
     }

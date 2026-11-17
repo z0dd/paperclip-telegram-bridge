@@ -1,6 +1,6 @@
 # Runbook
 
-Эксплуатация bridge в Docker Compose по образцу `deploy/compose.example.yml` (сервис `bridge`).
+Эксплуатация bridge в Docker Compose по образцу `deploy/compose.example.yml` или `deploy/compose.host-network.example.yml` (сервис `bridge`; различия — в разделе 6).
 
 **Важно про образ.** Runtime-образ — distroless: в нём **нет shell, `sqlite3`, `tar`, `curl`, `ps`**. Внутри контейнера можно запускать только бинарь `/usr/local/bin/bridge` (`docker compose exec bridge /usr/local/bin/bridge <подкоманда>` или `docker compose run --rm bridge <подкоманда>`). Любые `docker exec … sh`, `… sqlite3` не работают. Работа с файлами состояния — через отдельный контейнер ([BACKUP_RESTORE.md](BACKUP_RESTORE.md)).
 
@@ -29,6 +29,10 @@ docker compose exec bridge /usr/local/bin/bridge healthcheck   # "healthy" ил�
 | `unhealthy: no successful paperclip call for Ns` | Paperclip недоступен дольше `HEALTH_MAX_STALE` | проверить Paperclip и сеть. В чате после 3 подряд неудач приходит «⚠️ Paperclip недоступен с ЧЧ:ММ», после восстановления — «✅ Связь с Paperclip восстановлена» |
 | В логах `getUpdates conflict: another bridge instance is running or a webhook is set for this bot` | второй экземпляр на этом боте или у бота установлен webhook (Telegram отвечает 409 на `getUpdates`) | остановить второй экземпляр; webhook bridge сам **не снимает**, удалите его средствами Bot API (`deleteWebhook`). Bridge повторяет попытки с паузой до 5 минут |
 | В логах `telegram rejected the bot token` | токен бота неверен или отозван в BotFather | записать новый токен в файл секрета и перезапустить. Повтор раз в 5 минут |
+| В логах WARN `paperclip version differs from the tested one`, `paperclip version is missing` или `paperclip version is not recognized` | версия Paperclip отличается от проверенной (`tested_version` в записи), не отдана или не формата `YYYY.MMDD.N` | **запуск не блокируется**, bridge работает. Версия контракта могла измениться: проверьте ответы на карточки и [PAPERCLIP_PERMISSIONS](PAPERCLIP_PERMISSIONS.md); проверенная версия — константа в `src/paperclip/version.rs` |
+| Бот не стартует, `configuration error` про файл секрета, при этом файл существует | контейнер (UID 65532) не может прочитать файл: у файла владелец хост-пользователь и права `0400`/`0600`/`0640` (rootless Docker) | пересоздать файл по рецепту из раздела 3.5 или поставить `0644` в каталоге `0700` |
+| В чате «🔄 Bridge обновлён: черновик ответа на … сброшен, текст не отправлен» после обновления | миграция v1.1.0: незавершённый draft однотекстовой карточки сброшен | ожидаемо; ответьте на вопрос обычным сообщением |
+| Текст в чат отправлен, но бот пишет «Открыто несколько вопросов» или «Сейчас нет вопросов…» | сообщение без reply, а открыто несколько однотекстовых карточек или ни одной | ответить reply на нужную карточку; в Paperclip ничего не ушло |
 | В логах `paperclip health check failed, continuing` при старте | `GET /api/health` не ответил при запуске | проверить `PAPERCLIP_URL` и сеть; bridge продолжает работу и ретраит |
 | В логах `ignored update from outside the allowlist` (`reason`: `chat_mismatch`, `user_mismatch`, `not_private`) | кто-то пишет боту или неверно заданы `TELEGRAM_CHAT_ID`/`TELEGRAM_USER_ID` | если это вы: сверить ID. Чужим бот не отвечает. Запись не чаще раза в 10 секунд |
 | Ответ нажат, но в Paperclip его нет; в чате «⏳ ответ … в очереди» | Paperclip недоступен или отвечает 5xx/429/409 без кода; ответ хранится в outbox и отправляется бессрочно | дождаться восстановления; длина очереди видна в `/status` |
@@ -72,7 +76,7 @@ Board key **бессрочный** (решение пользователя) и 
 ### 3.3. Плановая ротация (рекомендация: раз в 90 дней, срока у ключа нет)
 
 1. Создать новый board key Paperclip (UI/CLI, `docs/paperclip-api.md` §2).
-2. Записать его в файл секрета (`secrets/paperclip_token`), права `0600`/`0400`.
+2. Заменить файл секрета (`secrets/paperclip_token`): удалить старый, записать новый и выставить владельца и права по рецепту из раздела 3.5. Обычный `chmod 0600`/`0400` у файла хост-пользователя в rootless Docker не подходит.
 3. `docker compose restart bridge` (или `up -d --force-recreate`).
 4. Убедиться: `docker compose exec bridge /usr/local/bin/bridge healthcheck` печатает `healthy`; для проверки ключа дождитесь одного цикла `sync` (15 с по умолчанию) и убедитесь, что нет сообщения об отклонённом ключе.
 5. Отозвать старый ключ (способы 1–2 из 3.1; `revoke-paperclip-key` после смены файла отозвал бы уже **новый** ключ).
@@ -80,6 +84,28 @@ Board key **бессрочный** (решение пользователя) и 
 ### 3.4. Ротация токена бота
 
 В BotFather: `/revoke` (выдаёт новый токен) → записать в `secrets/telegram_bot_token` → `docker compose restart bridge`. Состояние (offset) сохраняется.
+
+### 3.5. Права файлов секретов (rootless Docker)
+
+Контейнер работает с UID 65532. В rootless Docker он соответствует host-UID `subuid_start + 65531` (проверено в CI, job `rootless-secrets`), поэтому права файла, который принадлежит хост-пользователю, не работают так, как привычно. Каталог `secrets/` в `.gitignore`.
+
+| Вариант | Файл | Читает контейнер | Читает хост-пользователь |
+|---|---|---|---|
+| **Рекомендуемый (строгий):** владелец 65532 (через контейнер), `0400`, каталог `0700` | `chown 65532:65532` + `chmod 0400` | да | нет |
+| Допустимый: каталог `0700` у хост-пользователя, файл `0644` | `chmod 0644` | да | да |
+| Не работает: `0400`, `0600`, `0640` у файла хост-пользователя | | нет | да |
+
+Рецепт строгого варианта (он же при ротации: сначала удалить старый файл):
+
+```bash
+install -d -m 0700 secrets
+( umask 077; printf '%s' '<telegram bot token>' > secrets/telegram_bot_token )
+( umask 077; printf '%s' '<paperclip token>'     > secrets/paperclip_token )
+docker run --rm --network none -v "$PWD/secrets:/s" busybox:1.37 \
+  sh -c 'chown 65532:65532 /s/telegram_bot_token /s/paperclip_token && chmod 0400 /s/telegram_bot_token /s/paperclip_token'
+```
+
+После строгого варианта хост-пользователь не может прочитать файл, а root хоста может в любом варианте. Секреты с владельцем 65532 удаляются и пересоздаются, а не правятся на месте. Rootful Docker не проверялся. Содержимое секретов нигде не печатайте.
 
 ## 4. Остановка, обновление
 
@@ -89,8 +115,25 @@ docker build -t paperclip-telegram-bridge:local .   # новая версия
 docker compose up -d
 ```
 
-Bridge при старте сам применяет миграции схемы; откат на более старую версию с уже мигрированной базой не поддерживается. Перед обновлением делайте backup ([BACKUP_RESTORE.md](BACKUP_RESTORE.md)). Незаконченные формы переживают рестарт: bridge сообщит в чате, какие формы не завершены, и продолжит с того же шага. Правило `stop_grace_period` > 2 × `SHUTDOWN_GRACE` — в README, раздел «Остановка».
+При первом старте v1.1.0 bridge сбрасывает незавершённые draft однотекстовых карточек (текст не отправляется) и сообщает об этом в чат; остальные draft сохраняются. Bridge при старте сам применяет миграции схемы; откат на более старую версию с уже мигрированной базой не поддерживается. Перед обновлением делайте backup ([BACKUP_RESTORE.md](BACKUP_RESTORE.md)). Незаконченные формы переживают рестарт: bridge сообщит в чате, какие формы не завершены, и продолжит с того же шага. Правило `stop_grace_period` > 2 × `SHUTDOWN_GRACE` — в README, раздел «Остановка».
 
 ## 5. Что известно только по документации, а не по реальному запуску
 
 Работа на живом Paperclip с board-ключом, governed-карточки, поведение proxy Xray и потеря питания не проверялись (см. ограничения в README).
+
+## 6. Развёртывание на хосте с Paperclip и Xray на loopback (`network_mode: host`)
+
+Файл `deploy/compose.host-network.example.yml`: Paperclip на `127.0.0.1:3100`, Xray HTTP proxy на `127.0.0.1:10808` (значения-плейсхолдеры, подставьте свои). Шаги:
+
+```bash
+docker build -t paperclip-telegram-bridge:local .
+cp deploy/compose.host-network.example.yml compose.yml   # проверить адреса PAPERCLIP_URL и TELEGRAM_PROXY_URL
+cp .env.example .env                                     # TELEGRAM_CHAT_ID, TELEGRAM_USER_ID, PAPERCLIP_COMPANY_IDS
+# файлы секретов: раздел 3.5
+docker compose run --rm bridge check-config
+docker compose up -d
+```
+
+Контейнер не публикует портов и не слушает входящих соединений. Hardening тот же, что в изолированном примере (`read_only`, `65532:65532`, `cap_drop: [ALL]`, `no-new-privileges`, `tmpfs /tmp`, том `bridge-state`, `stop_grace_period: 30s`).
+
+**Компромисс.** С `network_mode: host` у контейнера есть прямой маршрут в интернет и доступ ко всем loopback-сервисам хоста; изоляция сетями (`paperclip_internal`, `xray_egress`) не действует. В коде Telegram-клиент идёт только через `TELEGRAM_PROXY_URL` и не имеет обходного пути: недоступный proxy означает отсутствие запросов к Telegram, а не прямой выход. Ограничить исходящий трафик контейнера можно только firewall хоста, это вне поставки и не проверялось. Если proxy или Paperclip не отвечают, проверьте, что демон Docker видит loopback хоста: в rootless Docker это так при запуске rootlesskit с `--detach-netns` (Docker 29.10.0, проверено в CI); в старых установках `127.0.0.1` внутри контейнера не ведёт на хост. Живой деплой на сервер пользователя не проверялся.

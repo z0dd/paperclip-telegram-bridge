@@ -61,6 +61,37 @@ jobs:
           log-level: warn
           command: check all
 
+  gitignore:
+    name: gitignore-secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check that secrets paths are gitignored
+        run: |
+          git check-ignore -q secrets/telegram_bot_token || (echo "❌ secrets/telegram_bot_token not in .gitignore"; exit 1)
+          git check-ignore -q secrets/paperclip_token || (echo "❌ secrets/paperclip_token not in .gitignore"; exit 1)
+          echo "✓ All secrets paths are correctly ignored"
+      - name: Negative test (check fails without the rules)
+        run: bash scripts/gitignore-check-test.sh
+
+  compose-config:
+    name: compose-config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate compose examples and compare hardening
+        run: bash scripts/compose-config-check.sh
+
+  rootless-secrets:
+    name: rootless-secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install rootless Docker (pinned version, sha256-verified)
+        run: bash scripts/rootless-docker-install.sh
+      - name: Secret file permissions matrix in rootless Docker
+        run: bash scripts/secrets-rootless-test.sh
+
   docker:
     name: docker
     runs-on: ubuntu-latest
@@ -77,3 +108,7 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Run smoke tests
         run: bash scripts/docker-smoke.sh
+      - name: Compose smoke (both examples)
+        run: |
+          docker tag paperclip-telegram-bridge:test paperclip-telegram-bridge:local
+          bash scripts/compose-smoke.sh

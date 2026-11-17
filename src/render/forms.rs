@@ -8,6 +8,9 @@ use crate::domain::*;
 use crate::store::Delivery;
 use crate::telegram::{Button, InlineKeyboard};
 
+pub const CHAT_TEXT_HINT: &str =
+    "Ответьте обычным сообщением в этот чат (или reply на эту карточку)";
+
 pub fn answer_at(draft: Option<&Draft>, q: usize) -> Option<&FormAnswer> {
     draft
         .and_then(|d| d.answers.form.get(q))
@@ -122,6 +125,14 @@ pub fn questions_tail(
         kb.row(vec![button("Отправить", cb(d, Op::Submit))]);
         return (tail, Some(kb));
     }
+    // A one-question text card is answered by a plain chat message: no
+    // buttons (ADR-0009 §1). `question_lines` already adds the format hint.
+    if f.single_text().is_some() {
+        question_lines(&mut tail, f, 0);
+        tail.blank();
+        tail.line(CHAT_TEXT_HINT);
+        return (tail, None);
+    }
     if let Some(Awaiting::Text { question }) = draft.and_then(|x| x.awaiting)
         && let Some(q) = f.questions.get(question)
     {
@@ -169,6 +180,7 @@ pub fn questions_tail(
                 )]);
             }
         }
+        // Text questions of multi-question forms; one-question ones return above.
         AnswerMode::Text => kb.row(vec![button(
             "✍️ Ответить текстом",
             cb(d, Op::Text).with_a(step),

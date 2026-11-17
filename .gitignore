@@ -18,6 +18,7 @@
 *.pem
 *.p12
 *.pkcs12
+/secrets/
 
 # Database & State
 *.db

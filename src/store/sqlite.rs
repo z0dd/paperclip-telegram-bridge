@@ -145,6 +145,52 @@ pub fn recover(c: &mut Connection) -> Result<Recovery> {
     })
 }
 
+pub fn reset_chat_text_drafts(c: &mut Connection) -> Result<Vec<ResetDraft>> {
+    use crate::domain::InteractionBody;
+    let tx = c.transaction()?;
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT d.id, d.issue_ref, d.status, d.snapshot_json
+             FROM drafts dr JOIN deliveries d ON d.id = dr.delivery_id ORDER BY d.id",
+        )?;
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let ts = now();
+    let mut redraw = Vec::new();
+    for (id, issue_ref, status, snapshot_json) in rows {
+        // An undecodable snapshot is not a chat-text card: left as is.
+        let Ok(snapshot) = serde_json::from_str::<Snapshot>(&snapshot_json) else {
+            continue;
+        };
+        if !matches!(&snapshot.interaction.body,
+            InteractionBody::Questions(f) if f.single_text().is_some())
+        {
+            continue;
+        }
+        tx.execute("DELETE FROM drafts WHERE delivery_id = ?1", [id])?;
+        tx.execute(
+            "UPDATE deliveries SET gen = gen + 1, updated_at = ?2 WHERE id = ?1",
+            params![id, ts],
+        )?;
+        if status == DeliveryStatus::Sent.as_str() {
+            redraw.push(ResetDraft {
+                delivery_id: id,
+                issue_ref,
+            });
+        }
+    }
+    tx.commit()?;
+    Ok(redraw)
+}
+
 pub fn commit_update(
     c: &mut Connection,
     update_id: Option<i64>,

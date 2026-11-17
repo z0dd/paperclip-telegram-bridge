@@ -4,11 +4,12 @@
 
 | Что | Где | Количество |
 |---|---|---|
-| Интеграционные тесты (mock Paperclip на wiremock, fake Telegram, реальный SQLite, реальный бинарь) | `tests/*.rs`, общая обвязка в `tests/support/` | 107 |
-| Unit-тесты | `#[cfg(test)]` в `src/**` | 47 |
+| Интеграционные тесты (mock Paperclip на wiremock, fake Telegram, реальный SQLite, реальный бинарь) | `tests/*.rs`, общая обвязка в `tests/support/` | 134 |
+| Unit-тесты | `#[cfg(test)]` в `src/**` | 52 |
 | Docker smoke-test | `scripts/docker-smoke.sh`, job `docker` в `.github/workflows/ci.yml` | 11 шагов |
+| Скрипты PET-12 (compose, секреты, gitignore) | `scripts/compose-config-check.sh`, `scripts/compose-smoke.sh`, `scripts/secrets-rootless-test.sh`, `scripts/gitignore-check-test.sh` | см. раздел «PET-12» |
 
-Интеграционные тесты по файлам: `cli.rs` 7, `core_flow.rs` 19, `crash.rs` 3, `e2e_binary.rs` 3, `env_proxy.rs` 1, `forms_flow.rs` 10, `governed.rs` 18, `paperclip_contract.rs` 21, `runs_commands.rs` 7, `sender.rs` 3, `store.rs` 11, `telegram_proxy.rs` 4.
+Интеграционные тесты по файлам: `chat_text.rs` 16, `cli.rs` 7, `core_flow.rs` 19, `crash.rs` 7, `draft_migration.rs` 3, `e2e_binary.rs` 7, `env_proxy.rs` 1, `forms_flow.rs` 10, `governed.rs` 18, `paperclip_contract.rs` 21, `runs_commands.rs` 7, `sender.rs` 3, `store.rs` 11, `telegram_proxy.rs` 4.
 
 Цифры считаются командой `grep -cE '^\s*#\[(tokio::)?test' <файл>`. Ссылки таблицы ниже проверяет `scripts/check-testing-refs.sh`.
 
@@ -24,7 +25,7 @@ bash scripts/check-testing-refs.sh    # каждая ссылка «файл::т
 
 Образ для smoke-test: `docker build -t paperclip-telegram-bridge:test .`. Внешняя сеть и настоящие credentials не нужны: токены фиктивные (`TEST-DUMMY-TOKEN`, `pcp_dummy`), upstream-адреса указывают на закрытый порт `127.0.0.1:9`.
 
-CI (`gh pr checks 1`): `fmt`, `clippy`, `test`, `deny`, `docker` (сборка с `load: true` + smoke-test) на каждый push в PR.
+CI (`gh pr checks`): `fmt`, `clippy`, `test`, `deny`, `gitignore-secrets`, `compose-config`, `rootless-secrets`, `docker` (сборка с `load: true` + smoke-test + compose smoke) на каждый push в PR.
 
 ## Docker smoke-test
 
@@ -194,6 +195,67 @@ CI (`gh pr checks 1`): `fmt`, `clippy`, `test`, `deny`, `docker` (сборка �
 | SIGTERM при in-flight outbox → exit 0, без потерь | `tests/e2e_binary.rs::sigterm_with_answer_in_flight_finishes_it` | покрыто |
 | Docker smoke-test: non-root, read-only, healthcheck, порты, SIGTERM | `scripts/docker-smoke.sh` | покрыто (см. замечание про healthy выше) |
 | Docker smoke-test с mock-серверами в docker network | не делался | слабо: smoke использует закрытые порты вместо mock-серверов; сквозные сценарии с mock Paperclip/Telegram покрыты `tests/e2e_binary.rs` (реальный бинарь) вне контейнера |
+
+## PET-12 (v1.1.0): критерий приёмки → тест → job CI
+
+Источник критериев: ADR-0009 (`docs/adr/0009-v1.1.0-improvements.md`). Тесты Rust выполняет job `test` (`cargo test --all-features`, включая crash-тесты с feature `fault-injection`); скрипты — отдельные job'ы. Строки «№» — строки таблицы ADR-0009 §1.
+
+### Пункт 1. Текст как чат (ADR-0009 §1)
+
+| Сценарий | Тест | Job CI |
+|---|---|---|
+| Карточка однотекстового вопроса без кнопки «Ответить текстом», только подсказка | `tests/chat_text.rs::card_has_no_text_button_only_a_hint` | test |
+| №6: reply на карточку, ответ уходит сразу, без подтверждения | `tests/chat_text.rs::reply_to_card_is_queued_at_once`, `tests/forms_flow.rs::own_answer_and_text_reply` | test |
+| №12: без reply, одна подходящая карточка | `tests/chat_text.rs::message_without_reply_answers_the_only_card` | test |
+| №13: без reply, несколько карточек, ничего не отправляется | `tests/chat_text.rs::several_cards_ask_for_a_reply_and_send_nothing`, `tests/chat_text.rs::several_cards_in_different_issues_are_listed` | test |
+| №14: нет подходящей карточки, ничего не уходит в Paperclip | `tests/chat_text.rs::no_suitable_card_sends_nothing_to_paperclip`, `tests/core_flow.rs::reject_with_required_reason_waits_for_text` | test |
+| №7: невалидный текст, вопрос остаётся открытым | `tests/chat_text.rs::invalid_text_keeps_the_question_open` | test |
+| №5, №11: ожидающий сценарий (причина reject и т. п.) забирает текст первым | `tests/chat_text.rs::waiting_scenario_takes_the_text_first`, `tests/chat_text.rs::waiting_without_reply_does_not_answer_the_text_card` | test |
+| №8: reply на неподходящую карточку работает как раньше | `tests/chat_text.rs::reply_to_an_unsuitable_card_works_as_before`, `tests/chat_text.rs::multi_question_form_still_uses_the_text_button` | test |
+| №9, №15: повторный текст не даёт второго ответа | `tests/chat_text.rs::second_text_after_the_answer_is_not_sent` | test |
+| №10: reply на сообщение, не являющееся карточкой | `tests/chat_text.rs::reply_to_a_message_that_is_not_a_card_is_routed_like_plain_text` | test |
+| №3: повторная доставка того же update | `tests/chat_text.rs::repeated_update_is_ignored`, `tests/core_flow.rs::duplicate_update_is_processed_once` | test |
+| №16: старая кнопка → «Устарело» | `tests/chat_text.rs::old_text_button_is_stale` | test |
+| №17: отказ сервера (422) возвращает вопрос | `tests/chat_text.rs::server_rejection_reopens_the_question` | test |
+| №18: рестарт с непустым outbox, без reply | `tests/crash.rs::chat_text_answer_survives_a_restart_and_is_sent_once` | test (feature `fault-injection`) |
+| №18: рестарт с непустым outbox, reply | `tests/crash.rs::chat_text_reply_survives_a_restart_and_is_sent_once` | test (feature `fault-injection`) |
+| №18: падение после HTTP до коммита, reply: нет второго ответа | `tests/crash.rs::chat_text_crash_after_http_reconciles_without_a_second_answer` | test (feature `fault-injection`) |
+| №18: падение после HTTP до коммита, без reply: нет второго ответа | `tests/crash.rs::chat_text_without_reply_crash_after_http_reconciles_without_a_second_answer` | test (feature `fault-injection`) |
+| Регрессия неизменённых карточек: варианты, формы | `tests/forms_flow.rs::full_form_with_back_validation_and_summary`, `tests/forms_flow.rs::single_question_single_select_submits_on_press`, `tests/forms_flow.rs::legacy_free_text_option_is_sent_with_its_id` | test |
+| Регрессия: Approve/Reject | `tests/core_flow.rs::callback_sends_accept_once_and_updates_the_card`, `tests/core_flow.rs::reject_with_required_reason_waits_for_text`, `tests/core_flow.rs::optional_reason_and_cancel` | test |
+| Регрессия: destructive | `tests/governed.rs::destructive_confirm_mode_two_steps_then_approval_then_accept`, `tests/governed.rs::destructive_restart_between_steps_repeats_without_duplicate`, `tests/governed.rs::reject_destructive_rejects_linked_approval` | test |
+
+Правки старых тестов в PET-15 (`git diff main...pet-12-improvements -- tests/`) соответствуют ADR и ожиданий не ослабляют: `tests/core_flow.rs::reject_with_required_reason_waits_for_text` меняет только текст подсказки «Не жду текста» → «Сейчас нет вопросов, на которые можно ответить текстом» (строка 14); `tests/forms_flow.rs::own_answer_and_text_reply` убирает нажатие «Отправить» после reply, потому что подтверждения больше нет (строка 6), при этом проверка тела `respond` сохранена.
+
+### Пункт 2. Миграция старых draft (ADR-0009 §2)
+
+| Сценарий | Тест | Job CI |
+|---|---|---|
+| Первый старт: сброшены только draft однотекстовых карточек (A, D), B и C не тронуты, outbox пуст, к Paperclip нет POST | `tests/draft_migration.rs::first_start_resets_only_text_card_drafts` | test |
+| Второй старт ничего не меняет | `tests/draft_migration.rs::second_start_changes_nothing` | test |
+| Отказ перерисовки не останавливает старт, старая кнопка → «Устарело» | `tests/draft_migration.rs::failed_rerender_does_not_stop_the_start` | test |
+
+### Пункт 3. Проверка версии Paperclip (ADR-0009 §3)
+
+| Сценарий | Тест | Job CI |
+|---|---|---|
+| Классификация версий (tested / other / missing / unrecognized) | `src/paperclip/version.rs::classify_table` | test |
+| Совпала: один INFO, без WARN | `src/paperclip/version.rs::tested_version_is_one_info_without_warn`, `tests/e2e_binary.rs::tested_paperclip_version_is_info_only` (бинарь, запуск продолжается) | test |
+| Другая версия: WARN с обеими версиями, запуск продолжается | `src/paperclip/version.rs::other_version_warns_with_both_versions`, `tests/e2e_binary.rs::other_paperclip_version_warns_and_starts` | test |
+| Версию не удалось получить: WARN, запуск продолжается | `src/paperclip/version.rs::missing_version_warns`, `tests/e2e_binary.rs::missing_paperclip_version_warns_and_starts` | test |
+| Нераспознанный формат: WARN, запуск продолжается | `src/paperclip/version.rs::unrecognized_version_warns_and_is_truncated`, `tests/e2e_binary.rs::unrecognized_paperclip_version_warns_and_starts` | test |
+
+### Пункт 4. Deployment (ADR-0009 §4, §5)
+
+| Сценарий | Скрипт | Job CI |
+|---|---|---|
+| Оба compose-примера рендерятся, hardening совпадает, host-пример без `networks`/`ports` | `scripts/compose-config-check.sh` | `compose-config` |
+| Compose smoke обоих примеров (host: реальный образ и busybox с тем же hardening; isolated) | `scripts/compose-smoke.sh` | `docker` (шаг «Compose smoke») |
+| Права secret-файлов в rootless Docker: 0400 strict и 0644+каталог 0700 читаются; 0400/0600/0640 владельцем хоста не читаются контейнером; несовпадение → exit 1 | `scripts/secrets-rootless-test.sh` | `rootless-secrets` |
+| Секреты в `.gitignore` (позитивная проверка) | шаг «Check that secrets paths are gitignored» | `gitignore-secrets` |
+| Проверка gitignore падает при удалении правил (негативная, на временной копии) | `scripts/gitignore-check-test.sh` | `gitignore-secrets` |
+
+Ручные проверки, которых CI не заменяет: живой деплой на сервере пользователя (реальный Paperclip, Xray, rootless Docker с `network_mode: host`) и внешний вид карточек в клиенте Telegram.
 
 ## Известные ограничения набора
 

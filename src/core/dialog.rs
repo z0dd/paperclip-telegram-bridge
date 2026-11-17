@@ -13,6 +13,8 @@ use crate::timeutil;
 pub const STALE: &str = "Устарело";
 pub const NOT_WAITING: &str =
     "Не жду текста. Ответьте кнопкой под вопросом или reply на него. /help";
+pub const NO_TEXT_QUESTION: &str =
+    "Сейчас нет вопросов, на которые можно ответить текстом. Сообщение не отправлено.";
 pub const MAX_REASON_CHARS: usize = 4000;
 
 /// Result of handling one update. `ops` are committed together with the offset.
@@ -389,37 +391,73 @@ async fn on_message<P: PaperclipApi, T: TelegramApi>(
         };
     }
 
-    // Target: reply to a prompt or to a card message, otherwise the draft
-    // that currently waits for text.
-    let mut target: Option<(Delivery, Option<Draft>)> = None;
-    let mut via_reply = false;
+    // Routing order of ADR-0009 §1: reply to a prompt, reply to a card,
+    // a scenario waiting for text, then a chat-text card.
     if let Some(reply) = &m.reply_to_message {
         if let Some(dr) = ctx.store.draft_by_prompt_message(reply.message_id).await? {
             if let Some(d) = ctx.store.delivery(dr.delivery_id).await? {
-                target = Some((d, Some(dr)));
+                return Ok(text_for(ctx, &d, Some(dr), trimmed, false).await);
             }
         } else if let Some(d) = ctx.store.delivery_by_message(reply.message_id).await? {
+            if forms::is_chat_text_question(&d)
+                && let InteractionBody::Questions(f) = &d.snapshot.interaction.body
+            {
+                return Ok(forms::chat_text_answer(&d, f, trimmed));
+            }
             let dr = ctx.store.draft(d.id).await?;
-            via_reply = true;
-            target = Some((d, dr));
+            return Ok(text_for(ctx, &d, dr, trimmed, true).await);
         }
+        // A reply to anything else counts as a message without a reply.
     }
-    if target.is_none()
-        && let Some(dr) = ctx.store.text_awaiting_draft().await?
+    if let Some(dr) = ctx.store.text_awaiting_draft().await?
         && let Some(d) = ctx.store.delivery(dr.delivery_id).await?
     {
-        target = Some((d, Some(dr)));
+        return Ok(text_for(ctx, &d, Some(dr), trimmed, false).await);
     }
-    let Some((d, draft)) = target else {
-        return Ok(Effects::message(NOT_WAITING));
-    };
+    let open: Vec<Delivery> = ctx
+        .store
+        .deliveries_with_status(vec![DeliveryStatus::Sent])
+        .await?
+        .into_iter()
+        .filter(forms::is_chat_text_question)
+        .collect();
+    Ok(match open.as_slice() {
+        [] => Effects::message(NO_TEXT_QUESTION),
+        [d] => match &d.snapshot.interaction.body {
+            InteractionBody::Questions(f) => forms::chat_text_answer(d, f, trimmed),
+            _ => Effects::message(NO_TEXT_QUESTION),
+        },
+        many => {
+            let mut refs: Vec<String> = Vec::new();
+            for d in many {
+                let r = crate::render::escape(&d.issue_ref);
+                if !refs.contains(&r) {
+                    refs.push(r);
+                }
+            }
+            Effects::message(format!(
+                "Открыто несколько вопросов: {}. Ответьте reply на нужную карточку.",
+                refs.join(", ")
+            ))
+        }
+    })
+}
+
+/// Text for a known card: closed cards are refused, open ones go to `on_text`.
+async fn text_for<P: PaperclipApi, T: TelegramApi>(
+    ctx: &Ctx<P, T>,
+    d: &Delivery,
+    draft: Option<Draft>,
+    text: &str,
+    via_reply: bool,
+) -> Effects {
     if d.status != DeliveryStatus::Sent {
-        return Ok(Effects::message(format!(
+        return Effects::message(format!(
             "Карточка {} уже закрыта или ответ отправлен.",
             crate::render::escape(&d.issue_ref)
-        )));
+        ));
     }
-    Ok(on_text(ctx, &d, draft, trimmed, via_reply).await)
+    on_text(ctx, d, draft, text, via_reply).await
 }
 
 async fn on_text<P: PaperclipApi, T: TelegramApi>(
