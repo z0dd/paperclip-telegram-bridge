@@ -4,7 +4,6 @@
 pub const CHUNK_LIMIT: usize = 3500;
 /// Telegram limit for one message after entity parsing.
 pub const TELEGRAM_LIMIT: usize = 4096;
-pub const BUTTON_MAX_CHARS: usize = 32;
 
 /// Escapes `&`, `<`, `>` and `"`; everything else is plain text.
 pub fn escape(s: &str) -> String {
@@ -68,19 +67,21 @@ pub fn split(text: &str, limit: usize) -> Vec<String> {
     let mut rest = text.trim_matches('\n');
     while utf16_len(rest) > limit {
         let end = prefix_end(rest, limit);
-        // Look two characters past the limit so that a separator right at the
-        // boundary still counts; the piece itself (`..i`) never exceeds `end`.
-        let probe_end = rest[end..]
-            .char_indices()
-            .nth(2)
-            .map_or(rest.len(), |(i, _)| end + i);
-        let window = &rest[..probe_end];
-        let ok = |i: &usize| *i > 0 && *i <= end;
-        let (cut, skip) = if let Some(i) = window.rfind("\n\n").filter(ok) {
+        // The last separator that starts at or before the limit: a separator
+        // right at the boundary still counts, the piece (`..i`) never exceeds
+        // `end`.
+        let find = |sep: &str| {
+            let mut upto = (end + sep.len()).min(rest.len());
+            while !rest.is_char_boundary(upto) {
+                upto -= 1;
+            }
+            rest[..upto].rfind(sep).filter(|i| *i > 0 && *i <= end)
+        };
+        let (cut, skip) = if let Some(i) = find("\n\n") {
             (i, 2)
-        } else if let Some(i) = window.rfind('\n').filter(ok) {
+        } else if let Some(i) = find("\n") {
             (i, 1)
-        } else if let Some(i) = window.rfind(' ').filter(ok) {
+        } else if let Some(i) = find(" ") {
             (i, 1)
         } else {
             (end.max(rest.chars().next().map_or(1, char::len_utf8)), 0)
@@ -110,12 +111,6 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     }
     let kept: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{}…", kept.trim_end())
-}
-
-/// Button caption: single line, at most 32 characters.
-pub fn button_text(s: &str) -> String {
-    let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_chars(&one_line, BUTTON_MAX_CHARS)
 }
 
 #[cfg(test)]
@@ -157,6 +152,19 @@ mod tests {
     }
 
     #[test]
+    fn split_never_cuts_a_word_when_a_space_follows_the_limit() {
+        let text = (0..3000)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let parts = split(&text, CHUNK_LIMIT);
+        assert!(parts.len() > 1);
+        assert_eq!(parts.join(" "), text);
+        assert_eq!(split("aaaa bbbb cc", 6), vec!["aaaa", "bbbb", "cc"]);
+        assert_eq!(split("aaaa bb", 4), vec!["aaaa", "bb"]);
+    }
+
+    #[test]
     fn split_never_breaks_surrogate_pairs() {
         let text = "🚀".repeat(10);
         let parts = split(&text, 5);
@@ -181,11 +189,5 @@ mod tests {
         assert_eq!(truncate_chars("abcdef", 4), "abc…");
         assert_eq!(truncate_chars("abc", 4), "abc");
         assert_eq!(truncate_utf16("🚀🚀🚀", 4), "🚀…");
-        assert_eq!(
-            button_text("1. a very long option label that exceeds"),
-            "1. a very long option label tha…"
-        );
-        assert_eq!(button_text("multi\nline"), "multi line");
-        assert!(button_text(&"я".repeat(100)).chars().count() <= BUTTON_MAX_CHARS);
     }
 }

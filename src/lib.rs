@@ -1,5 +1,5 @@
-//! paperclip-telegram-bridge: delivers pending Paperclip interactions to one
-//! Telegram user and sends the answers back.
+//! paperclip-telegram-bridge: mirrors Paperclip Agent Chat conversations into
+//! topics of one Telegram forum supergroup and sends the user's messages back.
 
 pub mod app;
 pub mod config;

@@ -3,16 +3,15 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::*;
-use crate::domain::{Awaiting, DraftAnswers};
 use crate::timeutil;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const MIGRATIONS: &[&str] = &[
-    // 1: initial schema (architecture §4.1, plus deliveries.follow_until).
+    // 1: v1 schema (cards), unchanged: a v1 state file migrates step by step.
     r#"
     CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
@@ -67,6 +66,91 @@ const MIGRATIONS: &[&str] = &[
 
     CREATE TABLE seen_runs (run_id TEXT PRIMARY KEY, seen_at TEXT NOT NULL);
     CREATE TABLE seen_done_issues (issue_id TEXT PRIMARY KEY, seen_at TEXT NOT NULL);
+    "#,
+    // 2: v2 (ADR-0010 §2.4). Card state is not needed: v1 tables are dropped,
+    // `meta.telegram_offset` is kept.
+    r#"
+    DROP TABLE IF EXISTS drafts;
+    DROP TABLE IF EXISTS outbox;
+    DROP TABLE IF EXISTS delivery_messages;
+    DROP TABLE IF EXISTS deliveries;
+    DROP TABLE IF EXISTS seen_runs;
+    DROP TABLE IF EXISTS seen_done_issues;
+    DELETE FROM meta WHERE key IN ('runs_baseline_at', 'done_baseline_at', 'self_user_id');
+
+    CREATE TABLE companies (
+      company_id        TEXT PRIMARY KEY,
+      name              TEXT NOT NULL,
+      issue_prefix      TEXT NOT NULL,
+      key_ref           TEXT NOT NULL,
+      last_seen_at      TEXT NOT NULL,
+      unavailable_since TEXT
+    );
+
+    CREATE TABLE conversations (
+      issue_id             TEXT PRIMARY KEY,
+      company_id           TEXT NOT NULL,
+      identifier           TEXT,
+      agent_id             TEXT NOT NULL,
+      agent_name           TEXT NOT NULL,
+      key_ref              TEXT NOT NULL,
+      discovered_at        TEXT NOT NULL,
+      watermark_comment_id TEXT,
+      cursor_comment_id    TEXT,
+      last_updated_at      TEXT,
+      hot_until            TEXT,
+      last_swept_at        TEXT,
+      topic_thread_id      INTEGER UNIQUE,
+      topic_name           TEXT NOT NULL,
+      topic_state          TEXT NOT NULL CHECK (topic_state IN ('pending','active','closed','recreating')),
+      removed_at           TEXT
+    );
+
+    CREATE TABLE seen_comments (
+      issue_id   TEXT NOT NULL,
+      comment_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (issue_id, comment_id)
+    );
+
+    CREATE TABLE tg_outbox (
+      id                  INTEGER PRIMARY KEY,
+      issue_id            TEXT NOT NULL,
+      comment_id          TEXT NOT NULL,
+      chunk               INTEGER NOT NULL,
+      chunks              INTEGER NOT NULL,
+      html                TEXT,
+      plain               TEXT,
+      use_plain           INTEGER NOT NULL DEFAULT 0,
+      status              TEXT NOT NULL CHECK (status IN ('pending','sending','sent','abandoned')),
+      attempts            INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at     TEXT NOT NULL,
+      telegram_message_id INTEGER,
+      created_at          TEXT NOT NULL,
+      updated_at          TEXT NOT NULL,
+      UNIQUE (comment_id, chunk)
+    );
+    CREATE INDEX tg_outbox_pending ON tg_outbox(status, issue_id, id);
+
+    CREATE TABLE pc_outbox (
+      id                INTEGER PRIMARY KEY,
+      chat_id           INTEGER NOT NULL,
+      message_id        INTEGER NOT NULL,
+      update_id         INTEGER NOT NULL,
+      issue_id          TEXT NOT NULL,
+      client_request_id TEXT NOT NULL,
+      body              TEXT,
+      status            TEXT NOT NULL CHECK (status IN ('pending','in_flight','done','rejected')),
+      attempts          INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at   TEXT NOT NULL,
+      last_error        TEXT,
+      comment_id        TEXT,
+      notified          INTEGER NOT NULL DEFAULT 0,
+      created_at        TEXT NOT NULL,
+      updated_at        TEXT NOT NULL,
+      UNIQUE (chat_id, message_id)
+    );
+    CREATE INDEX pc_outbox_due ON pc_outbox(status, next_attempt_at);
     "#,
 ];
 
@@ -125,594 +209,468 @@ pub fn set_meta(c: &Connection, key: &str, value: &str) -> Result<()> {
 
 pub fn recover(c: &mut Connection) -> Result<Recovery> {
     let tx = c.transaction()?;
-    let outbox_reset = tx.execute(
-        "UPDATE outbox SET status = 'pending', updated_at = ?1 WHERE status = 'in_flight'",
-        [now()],
-    )?;
-    let sending = {
-        let mut stmt =
-            tx.prepare("SELECT id FROM deliveries WHERE status = 'sending' ORDER BY id")?;
-        stmt.query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<i64>>>()?
-    };
-    if get_meta(&tx, meta::STARTED_AT)?.is_none() {
-        set_meta(&tx, meta::STARTED_AT, &now())?;
-    }
-    tx.commit()?;
-    Ok(Recovery {
-        outbox_reset,
-        sending,
-    })
-}
-
-pub fn reset_chat_text_drafts(c: &mut Connection) -> Result<Vec<ResetDraft>> {
-    use crate::domain::InteractionBody;
-    let tx = c.transaction()?;
-    let rows = {
-        let mut stmt = tx.prepare(
-            "SELECT d.id, d.issue_ref, d.status, d.snapshot_json
-             FROM drafts dr JOIN deliveries d ON d.id = dr.delivery_id ORDER BY d.id",
-        )?;
-        stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-    };
     let ts = now();
-    let mut redraw = Vec::new();
-    for (id, issue_ref, status, snapshot_json) in rows {
-        // An undecodable snapshot is not a chat-text card: left as is.
-        let Ok(snapshot) = serde_json::from_str::<Snapshot>(&snapshot_json) else {
-            continue;
-        };
-        if !matches!(&snapshot.interaction.body,
-            InteractionBody::Questions(f) if f.single_text().is_some())
-        {
-            continue;
-        }
-        tx.execute("DELETE FROM drafts WHERE delivery_id = ?1", [id])?;
-        tx.execute(
-            "UPDATE deliveries SET gen = gen + 1, updated_at = ?2 WHERE id = ?1",
-            params![id, ts],
-        )?;
-        if status == DeliveryStatus::Sent.as_str() {
-            redraw.push(ResetDraft {
-                delivery_id: id,
-                issue_ref,
-            });
-        }
+    let pc_reset = tx.execute(
+        "UPDATE pc_outbox SET status = 'pending', updated_at = ?1 WHERE status = 'in_flight'",
+        [&ts],
+    )?;
+    tx.execute(
+        "UPDATE tg_outbox SET status = 'pending', updated_at = ?1 WHERE status = 'sending'",
+        [&ts],
+    )?;
+    if get_meta(&tx, meta::STARTED_AT)?.is_none() {
+        set_meta(&tx, meta::STARTED_AT, &ts)?;
     }
     tx.commit()?;
-    Ok(redraw)
+    Ok(Recovery { pc_reset })
 }
 
 pub fn commit_update(
     c: &mut Connection,
-    update_id: Option<i64>,
-    ops: Vec<StoreOp>,
+    update_id: i64,
+    entry: Option<NewPcEntry>,
 ) -> Result<CommitOutcome> {
     let tx = c.transaction()?;
-    if let Some(uid) = update_id {
-        let offset: i64 = get_meta(&tx, meta::TELEGRAM_OFFSET)?
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        if uid < offset {
-            return Ok(CommitOutcome::Duplicate);
-        }
+    let offset: i64 = get_meta(&tx, meta::TELEGRAM_OFFSET)?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if update_id < offset {
+        return Ok(CommitOutcome::Duplicate);
     }
-    for op in ops {
-        apply_op(&tx, op)?;
+    if let Some(e) = entry {
+        let ts = now();
+        tx.execute(
+            "INSERT OR IGNORE INTO pc_outbox(chat_id, message_id, update_id, issue_id,
+                 client_request_id, body, status, attempts, next_attempt_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, ?7, ?7)",
+            params![
+                e.chat_id,
+                e.message_id,
+                update_id,
+                e.issue_id,
+                e.client_request_id,
+                e.body,
+                ts
+            ],
+        )?;
     }
-    if let Some(uid) = update_id {
-        set_meta(&tx, meta::TELEGRAM_OFFSET, &(uid + 1).to_string())?;
-    }
+    set_meta(&tx, meta::TELEGRAM_OFFSET, &(update_id + 1).to_string())?;
     tx.commit()?;
     Ok(CommitOutcome::Applied)
 }
 
-fn apply_op(tx: &Transaction<'_>, op: StoreOp) -> Result<()> {
+pub fn upsert_companies(c: &mut Connection, rows: &[CompanyRow]) -> Result<()> {
+    let tx = c.transaction()?;
     let ts = now();
-    match op {
-        StoreOp::PutDraft(d) => put_draft(tx, &d)?,
-        StoreOp::DeleteDraft(id) => {
-            tx.execute("DELETE FROM drafts WHERE delivery_id = ?1", [id])?;
-        }
-        StoreOp::ClearOtherTextAwaiting { keep } => {
-            tx.execute(
-                "UPDATE drafts SET awaiting = NULL, updated_at = ?2
-                 WHERE delivery_id != ?1 AND awaiting IS NOT NULL AND awaiting != 'governed_confirm'",
-                params![keep, ts],
-            )?;
-        }
-        StoreOp::Enqueue {
-            delivery_id,
-            resolution,
-        } => {
-            let body = serde_json::to_string(&resolution).map_err(|_| StoreError::Decode)?;
-            let inserted = tx.execute(
-                "INSERT OR IGNORE INTO outbox(delivery_id, action, body_json, status, attempts,
-                                              next_attempt_at, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4, ?4)",
-                params![delivery_id, resolution.action_name(), body, ts],
-            )?;
-            if inserted > 0 {
-                tx.execute(
-                    "UPDATE deliveries SET status = 'answering', updated_at = ?2 WHERE id = ?1",
-                    params![delivery_id, ts],
-                )?;
-            }
-        }
-        StoreOp::SetStatus {
-            delivery_id,
-            status,
-            closed_reason,
-        } => {
-            tx.execute(
-                "UPDATE deliveries SET status = ?2, closed_reason = COALESCE(?3, closed_reason),
-                        updated_at = ?4 WHERE id = ?1",
-                params![delivery_id, status.as_str(), closed_reason, ts],
-            )?;
-        }
-        StoreOp::BumpGeneration(id) => {
-            tx.execute(
-                "UPDATE deliveries SET gen = gen + 1, updated_at = ?2 WHERE id = ?1",
-                params![id, ts],
-            )?;
-        }
+    for r in rows {
+        tx.execute(
+            "INSERT INTO companies(company_id, name, issue_prefix, key_ref, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(company_id) DO UPDATE SET name = excluded.name,
+                issue_prefix = excluded.issue_prefix, key_ref = excluded.key_ref,
+                last_seen_at = excluded.last_seen_at",
+            params![r.company_id, r.name, r.issue_prefix, r.key_ref, ts],
+        )?;
     }
+    tx.commit()?;
     Ok(())
 }
 
-fn put_draft(tx: &Connection, d: &Draft) -> Result<()> {
-    let answers = serde_json::to_string(&d.answers).map_err(|_| StoreError::Decode)?;
-    tx.execute(
-        "INSERT INTO drafts(delivery_id, step, answers_json, awaiting, prompt_message_id, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(delivery_id) DO UPDATE SET step = excluded.step,
-            answers_json = excluded.answers_json, awaiting = excluded.awaiting,
-            prompt_message_id = excluded.prompt_message_id, updated_at = excluded.updated_at",
-        params![
-            d.delivery_id,
-            d.step as i64,
-            answers,
-            d.awaiting.map(Awaiting::to_db),
-            d.prompt_message_id,
-            d.updated_at,
-        ],
-    )?;
-    Ok(())
+const CONVERSATION_COLS: &str = "issue_id, company_id, identifier, agent_id, agent_name, key_ref,
+    discovered_at, watermark_comment_id, cursor_comment_id, last_updated_at, hot_until,
+    last_swept_at, topic_thread_id, topic_name, topic_state, removed_at";
+
+fn conversation_row(r: &Row<'_>) -> rusqlite::Result<Conversation> {
+    let state: String = r.get(14)?;
+    Ok(Conversation {
+        issue_id: r.get(0)?,
+        company_id: r.get(1)?,
+        identifier: r.get(2)?,
+        agent_id: r.get(3)?,
+        agent_name: r.get(4)?,
+        key_ref: r.get(5)?,
+        discovered_at: r.get(6)?,
+        watermark_comment_id: r.get(7)?,
+        cursor_comment_id: r.get(8)?,
+        last_updated_at: r.get(9)?,
+        hot_until: r.get(10)?,
+        last_swept_at: r.get(11)?,
+        topic_thread_id: r.get(12)?,
+        topic_name: r.get(13)?,
+        topic_state: TopicState::parse(&state),
+        removed_at: r.get(15)?,
+    })
 }
 
-pub fn insert_delivery(c: &mut Connection, d: &NewDelivery) -> Result<Option<i64>> {
-    let snapshot = serde_json::to_string(&d.snapshot).map_err(|_| StoreError::Decode)?;
-    let ts = now();
-    let n = c.execute(
-        "INSERT OR IGNORE INTO deliveries(interaction_id, company_id, issue_id, issue_ref, kind,
-                                          snapshot_json, status, gen, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?8)",
-        params![
-            d.interaction_id,
-            d.company_id,
-            d.issue_id,
-            d.issue_ref,
-            d.snapshot.interaction.kind.as_str(),
-            snapshot,
-            d.status.as_str(),
-            ts
-        ],
-    )?;
-    Ok((n > 0).then(|| c.last_insert_rowid()))
-}
-
-const DELIVERY_COLS: &str =
-    "id, interaction_id, company_id, issue_id, issue_ref, kind, snapshot_json,
-    status, gen, closed_reason, follow_until, created_at, updated_at";
-
-fn delivery_row(r: &Row<'_>) -> rusqlite::Result<(Delivery, String)> {
-    let snapshot_json: String = r.get(6)?;
-    let status: String = r.get(7)?;
-    Ok((
-        Delivery {
-            id: r.get(0)?,
-            interaction_id: r.get(1)?,
-            company_id: r.get(2)?,
-            issue_id: r.get(3)?,
-            issue_ref: r.get(4)?,
-            kind: r.get(5)?,
-            snapshot: Snapshot {
-                interaction: placeholder_interaction(),
-                issue_title: None,
-                agent_name: None,
-            },
-            status: DeliveryStatus::parse(&status).unwrap_or(DeliveryStatus::Closed),
-            generation: r.get(8)?,
-            closed_reason: r.get(9)?,
-            follow_until: r.get(10)?,
-            created_at: r.get(11)?,
-            updated_at: r.get(12)?,
-            messages: Vec::new(),
-        },
-        snapshot_json,
-    ))
-}
-
-fn placeholder_interaction() -> Interaction {
-    use crate::domain::*;
-    Interaction {
-        id: String::new(),
-        company_id: String::new(),
-        issue_id: String::new(),
-        kind: InteractionKind::Other(String::new()),
-        status: InteractionStatus::Pending,
-        title: None,
-        created_by_agent_id: None,
-        created_at: String::new(),
-        resolved_by_user_id: None,
-        resolved_by_agent_id: None,
-        addressee_agent_id: None,
-        addressee_user_id: None,
-        body: InteractionBody::Unsupported {
-            reason: UnsupportedReason::Malformed,
-        },
-        result: None,
-    }
-}
-
-fn finish_delivery(c: &Connection, (mut d, snapshot_json): (Delivery, String)) -> Result<Delivery> {
-    d.snapshot = serde_json::from_str(&snapshot_json).map_err(|_| StoreError::Decode)?;
-    let mut stmt = c.prepare_cached(
-        "SELECT chunk, message_id FROM delivery_messages WHERE delivery_id = ?1 ORDER BY chunk",
-    )?;
-    d.messages = stmt
-        .query_map([d.id], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(d)
-}
-
-fn query_deliveries(
+fn query_conversations(
     c: &Connection,
     where_sql: &str,
     p: impl rusqlite::Params,
-) -> Result<Vec<Delivery>> {
-    let sql = format!("SELECT {DELIVERY_COLS} FROM deliveries WHERE {where_sql}");
-    let rows = {
-        let mut stmt = c.prepare(&sql)?;
-        stmt.query_map(p, delivery_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    rows.into_iter().map(|r| finish_delivery(c, r)).collect()
+) -> Result<Vec<Conversation>> {
+    let mut stmt = c.prepare(&format!(
+        "SELECT {CONVERSATION_COLS} FROM conversations WHERE {where_sql}"
+    ))?;
+    Ok(stmt
+        .query_map(p, conversation_row)?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
-pub fn delivery(c: &mut Connection, id: i64) -> Result<Option<Delivery>> {
-    Ok(query_deliveries(c, "id = ?1", [id])?.pop())
+pub fn conversations(c: &mut Connection) -> Result<Vec<Conversation>> {
+    query_conversations(c, "1 = 1 ORDER BY discovered_at, issue_id", [])
 }
 
-pub fn delivery_by_interaction(c: &mut Connection, iid: &str) -> Result<Option<Delivery>> {
-    Ok(query_deliveries(c, "interaction_id = ?1", [iid])?.pop())
+pub fn conversation(c: &mut Connection, issue_id: &str) -> Result<Option<Conversation>> {
+    Ok(query_conversations(c, "issue_id = ?1", [issue_id])?.pop())
 }
 
-pub fn delivery_by_message(c: &mut Connection, message_id: i64) -> Result<Option<Delivery>> {
-    Ok(query_deliveries(
-        c,
-        "id = (SELECT delivery_id FROM delivery_messages WHERE message_id = ?1 LIMIT 1)",
-        [message_id],
-    )?
-    .pop())
+pub fn conversation_by_thread(c: &mut Connection, thread_id: i64) -> Result<Option<Conversation>> {
+    Ok(query_conversations(c, "topic_thread_id = ?1", [thread_id])?.pop())
 }
 
-pub fn deliveries_with_status(
-    c: &mut Connection,
-    statuses: &[DeliveryStatus],
-) -> Result<Vec<Delivery>> {
-    if statuses.is_empty() {
-        return Ok(Vec::new());
+pub fn insert_conversation(c: &mut Connection, n: &NewConversation) -> Result<bool> {
+    let tx = c.transaction()?;
+    let ts = now();
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO conversations(issue_id, company_id, identifier, agent_id,
+             agent_name, key_ref, discovered_at, watermark_comment_id, cursor_comment_id,
+             last_updated_at, last_swept_at, topic_name, topic_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?7, ?10, 'pending')",
+        params![
+            n.issue_id,
+            n.company_id,
+            n.identifier,
+            n.agent_id,
+            n.agent_name,
+            n.key_ref,
+            ts,
+            n.watermark_comment_id,
+            n.updated_at,
+            n.topic_name
+        ],
+    )? > 0;
+    if inserted && let Some(w) = &n.watermark_comment_id {
+        tx.execute(
+            "INSERT OR IGNORE INTO seen_comments(issue_id, comment_id, created_at) VALUES (?1, ?2, ?3)",
+            params![n.issue_id, w, ts],
+        )?;
     }
-    let list = statuses
-        .iter()
-        .map(|s| format!("'{}'", s.as_str()))
-        .collect::<Vec<_>>()
-        .join(",");
-    query_deliveries(c, &format!("status IN ({list}) ORDER BY id"), [])
+    tx.commit()?;
+    Ok(inserted)
 }
 
-pub fn known_interactions(c: &mut Connection, ids: &[String]) -> Result<Vec<String>> {
-    let mut stmt = c.prepare_cached("SELECT 1 FROM deliveries WHERE interaction_id = ?1")?;
+pub fn set_removed(c: &mut Connection, issue_id: &str, at: Option<&str>) -> Result<()> {
+    c.execute(
+        "UPDATE conversations SET removed_at = ?2 WHERE issue_id = ?1",
+        params![issue_id, at],
+    )?;
+    Ok(())
+}
+
+pub fn set_updated_at(
+    c: &mut Connection,
+    issue_id: &str,
+    updated_at: Option<&str>,
+    hot_until: &str,
+) -> Result<()> {
+    c.execute(
+        "UPDATE conversations SET last_updated_at = ?2,
+            hot_until = MAX(COALESCE(hot_until, ''), ?3) WHERE issue_id = ?1",
+        params![issue_id, updated_at, hot_until],
+    )?;
+    Ok(())
+}
+
+pub fn extend_hot(c: &mut Connection, issue_id: &str, hot_until: &str) -> Result<()> {
+    c.execute(
+        "UPDATE conversations SET hot_until = MAX(COALESCE(hot_until, ''), ?2) WHERE issue_id = ?1",
+        params![issue_id, hot_until],
+    )?;
+    Ok(())
+}
+
+pub fn seen_of(c: &mut Connection, issue_id: &str, ids: &[String]) -> Result<Vec<String>> {
+    let mut stmt =
+        c.prepare_cached("SELECT 1 FROM seen_comments WHERE issue_id = ?1 AND comment_id = ?2")?;
     let mut out = Vec::new();
     for id in ids {
-        if stmt.exists([id])? {
+        if stmt.exists(params![issue_id, id])? {
             out.push(id.clone());
         }
     }
     Ok(out)
 }
 
-pub fn mark_sent(
-    c: &mut Connection,
-    id: i64,
-    status: DeliveryStatus,
-    messages: &[i64],
-) -> Result<()> {
+pub fn commit_comments(c: &mut Connection, b: &CommentBatch) -> Result<()> {
     let tx = c.transaction()?;
-    tx.execute("DELETE FROM delivery_messages WHERE delivery_id = ?1", [id])?;
-    for (chunk, m) in messages.iter().enumerate() {
-        tx.execute(
-            "INSERT INTO delivery_messages(delivery_id, chunk, message_id) VALUES (?1, ?2, ?3)",
-            params![id, chunk as i64, m],
+    let ts = now();
+    {
+        let mut seen = tx.prepare_cached(
+            "INSERT OR IGNORE INTO seen_comments(issue_id, comment_id, created_at) VALUES (?1, ?2, ?3)",
         )?;
+        for id in &b.seen {
+            seen.execute(params![b.issue_id, id, ts])?;
+        }
+        let mut chunk = tx.prepare_cached(
+            "INSERT OR IGNORE INTO tg_outbox(issue_id, comment_id, chunk, chunks, html, plain,
+                 status, attempts, next_attempt_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, ?7, ?7)",
+        )?;
+        for ch in &b.chunks {
+            chunk.execute(params![
+                b.issue_id,
+                ch.comment_id,
+                ch.chunk,
+                ch.chunks,
+                ch.html,
+                ch.plain,
+                ts
+            ])?;
+        }
     }
     tx.execute(
-        "UPDATE deliveries SET status = ?2, updated_at = ?3 WHERE id = ?1 AND status IN ('new', 'sending')",
-        params![id, status.as_str(), now()],
+        "UPDATE conversations SET cursor_comment_id = COALESCE(?2, cursor_comment_id),
+            last_swept_at = ?3,
+            hot_until = CASE WHEN ?4 IS NULL THEN hot_until
+                             ELSE MAX(COALESCE(hot_until, ''), ?4) END
+         WHERE issue_id = ?1",
+        params![b.issue_id, b.cursor, b.swept_at, b.hot_until],
     )?;
     tx.commit()?;
     Ok(())
 }
 
-pub fn replace_last_message(c: &mut Connection, id: i64, message_id: i64) -> Result<()> {
+pub fn purge_seen(c: &mut Connection, before: &str, keep: u32) -> Result<usize> {
     let tx = c.transaction()?;
-    let chunk: Option<i64> = tx
-        .query_row(
-            "SELECT MAX(chunk) FROM delivery_messages WHERE delivery_id = ?1",
-            [id],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
-    tx.execute(
-        "INSERT INTO delivery_messages(delivery_id, chunk, message_id) VALUES (?1, ?2, ?3)
-         ON CONFLICT(delivery_id, chunk) DO UPDATE SET message_id = excluded.message_id",
-        params![id, chunk.unwrap_or(0), message_id],
+    let n = tx.execute(
+        "DELETE FROM seen_comments WHERE rowid IN (
+           SELECT s.rowid FROM (
+             SELECT rowid, issue_id, comment_id, created_at,
+                    ROW_NUMBER() OVER (PARTITION BY issue_id ORDER BY created_at DESC, rowid DESC) AS rn
+             FROM seen_comments) s
+           LEFT JOIN conversations c ON c.issue_id = s.issue_id
+           WHERE s.created_at < ?1 AND s.rn > ?2
+             AND (c.cursor_comment_id IS NULL OR c.cursor_comment_id != s.comment_id)
+             AND (c.watermark_comment_id IS NULL OR c.watermark_comment_id != s.comment_id))",
+        params![before, keep],
     )?;
     tx.commit()?;
-    Ok(())
+    Ok(n)
 }
 
-pub fn close_delivery(
-    c: &mut Connection,
-    id: i64,
-    status: DeliveryStatus,
-    reason: &str,
-) -> Result<()> {
-    let tx = c.transaction()?;
-    tx.execute(
-        "UPDATE deliveries SET status = ?2, closed_reason = ?3, updated_at = ?4 WHERE id = ?1",
-        params![id, status.as_str(), reason, now()],
-    )?;
-    tx.execute("DELETE FROM drafts WHERE delivery_id = ?1", [id])?;
-    tx.commit()?;
-    Ok(())
-}
-
-pub fn update_snapshot(c: &mut Connection, id: i64, s: &Snapshot) -> Result<()> {
-    let json = serde_json::to_string(s).map_err(|_| StoreError::Decode)?;
-    c.execute(
-        "UPDATE deliveries SET snapshot_json = ?2, updated_at = ?3 WHERE id = ?1",
-        params![id, json, now()],
-    )?;
-    Ok(())
-}
-
-pub fn set_following(c: &mut Connection, id: i64, until: &str) -> Result<()> {
-    c.execute(
-        "UPDATE deliveries SET status = 'following', follow_until = ?2, updated_at = ?3 WHERE id = ?1",
-        params![id, until, now()],
-    )?;
-    Ok(())
-}
-
-fn draft_row(r: &Row<'_>) -> rusqlite::Result<(Draft, String)> {
-    let awaiting: Option<String> = r.get(3)?;
-    Ok((
-        Draft {
-            delivery_id: r.get(0)?,
-            step: r.get::<_, i64>(1)?.max(0) as usize,
-            answers: DraftAnswers::default(),
-            awaiting: awaiting.as_deref().and_then(Awaiting::from_db),
-            prompt_message_id: r.get(4)?,
-            updated_at: r.get(5)?,
-        },
-        r.get(2)?,
-    ))
-}
-
-fn query_drafts(c: &Connection, where_sql: &str, p: impl rusqlite::Params) -> Result<Vec<Draft>> {
-    let sql = format!(
-        "SELECT delivery_id, step, answers_json, awaiting, prompt_message_id, updated_at
-         FROM drafts WHERE {where_sql}"
-    );
-    let mut stmt = c.prepare(&sql)?;
-    let rows = stmt
-        .query_map(p, draft_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.into_iter()
-        .map(|(mut d, json)| {
-            d.answers = serde_json::from_str(&json).map_err(|_| StoreError::Decode)?;
-            Ok(d)
-        })
-        .collect()
-}
-
-pub fn draft(c: &mut Connection, id: i64) -> Result<Option<Draft>> {
-    Ok(query_drafts(c, "delivery_id = ?1", [id])?.pop())
-}
-
-pub fn drafts(c: &mut Connection) -> Result<Vec<Draft>> {
-    query_drafts(c, "1 = 1 ORDER BY delivery_id", [])
-}
-
-pub fn text_awaiting_draft(c: &mut Connection) -> Result<Option<Draft>> {
-    Ok(query_drafts(
+pub fn next_topic_job(c: &mut Connection) -> Result<Option<Conversation>> {
+    Ok(query_conversations(
         c,
-        "awaiting IS NOT NULL AND awaiting != 'governed_confirm' ORDER BY updated_at DESC LIMIT 1",
+        "topic_state IN ('pending', 'recreating') AND removed_at IS NULL
+         ORDER BY discovered_at, issue_id LIMIT 1",
         [],
     )?
     .pop())
 }
 
-pub fn draft_by_prompt_message(c: &mut Connection, message_id: i64) -> Result<Option<Draft>> {
-    Ok(query_drafts(c, "prompt_message_id = ?1", [message_id])?.pop())
-}
-
-pub fn set_prompt_message(c: &mut Connection, id: i64, message_id: i64) -> Result<()> {
+pub fn set_topic(c: &mut Connection, issue_id: &str, thread_id: i64) -> Result<()> {
     c.execute(
-        "UPDATE drafts SET prompt_message_id = ?2 WHERE delivery_id = ?1",
-        params![id, message_id],
+        "UPDATE conversations SET topic_thread_id = ?2, topic_state = 'active' WHERE issue_id = ?1",
+        params![issue_id, thread_id],
     )?;
     Ok(())
 }
 
-const OUTBOX_COLS: &str =
-    "id, delivery_id, body_json, status, attempts, next_attempt_at, last_error, created_at";
+pub fn topic_lost(c: &mut Connection, issue_id: &str, thread_id: i64) -> Result<()> {
+    c.execute(
+        "UPDATE conversations SET topic_thread_id = NULL, topic_state = 'recreating'
+         WHERE issue_id = ?1 AND topic_thread_id = ?2",
+        params![issue_id, thread_id],
+    )?;
+    Ok(())
+}
 
-fn outbox_row(r: &Row<'_>) -> rusqlite::Result<OutboxEntry> {
-    let body: Option<String> = r.get(2)?;
-    let status: String = r.get(3)?;
-    Ok(OutboxEntry {
+const CHUNK_COLS: &str = "o.id, o.issue_id, o.comment_id, o.chunk, o.chunks, o.html, o.plain,
+    o.use_plain, o.attempts, c.topic_thread_id";
+
+fn chunk_row(r: &Row<'_>) -> rusqlite::Result<TgChunk> {
+    Ok(TgChunk {
         id: r.get(0)?,
-        delivery_id: r.get(1)?,
-        resolution: body.and_then(|b| serde_json::from_str(&b).ok()),
-        status: OutboxStatus::parse(&status).unwrap_or(OutboxStatus::Abandoned),
-        attempts: r.get::<_, i64>(4)?.max(0) as u32,
-        next_attempt_at: r.get(5)?,
-        last_error: r.get(6)?,
-        created_at: r.get(7)?,
+        issue_id: r.get(1)?,
+        comment_id: r.get(2)?,
+        chunk: r.get(3)?,
+        chunks: r.get(4)?,
+        html: r.get(5)?,
+        plain: r.get(6)?,
+        use_plain: r.get::<_, i64>(7)? != 0,
+        attempts: r.get::<_, i64>(8)?.max(0) as u32,
+        thread_id: r.get(9)?,
     })
 }
 
-pub fn outbox_for(c: &mut Connection, delivery_id: i64) -> Result<Option<OutboxEntry>> {
+pub fn next_chunk(c: &mut Connection, now: &str) -> Result<Option<TgChunk>> {
     Ok(c.query_row(
-        &format!("SELECT {OUTBOX_COLS} FROM outbox WHERE delivery_id = ?1"),
-        [delivery_id],
-        outbox_row,
+        &format!(
+            "SELECT {CHUNK_COLS} FROM tg_outbox o JOIN conversations c ON c.issue_id = o.issue_id
+             WHERE o.status = 'pending' AND o.next_attempt_at <= ?1
+               AND c.topic_state = 'active' AND c.topic_thread_id IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM tg_outbox p
+                               WHERE p.issue_id = o.issue_id AND p.status = 'pending' AND p.id < o.id)
+             ORDER BY o.id LIMIT 1"
+        ),
+        [now],
+        chunk_row,
     )
     .optional()?)
 }
 
-pub fn due_outbox(c: &mut Connection, now: &str) -> Result<Vec<OutboxEntry>> {
-    let mut stmt = c.prepare(&format!(
-        "SELECT {OUTBOX_COLS} FROM outbox WHERE status = 'pending' AND next_attempt_at <= ?1
-         ORDER BY next_attempt_at, id"
-    ))?;
-    Ok(stmt
-        .query_map([now], outbox_row)?
-        .collect::<rusqlite::Result<_>>()?)
-}
-
-pub fn next_outbox_due(c: &mut Connection) -> Result<Option<String>> {
+pub fn next_chunk_due(c: &mut Connection) -> Result<Option<String>> {
     Ok(c.query_row(
-        "SELECT MIN(next_attempt_at) FROM outbox WHERE status = 'pending'",
+        "SELECT MIN(next_attempt_at) FROM tg_outbox WHERE status = 'pending'",
         [],
         |r| r.get(0),
     )?)
 }
 
-pub fn pending_outbox_count(c: &mut Connection) -> Result<u64> {
+pub fn chunk_sent(c: &mut Connection, id: i64, message_id: i64) -> Result<()> {
+    // The text is the agent's reply: not kept once delivered.
+    c.execute(
+        "UPDATE tg_outbox SET status = 'sent', telegram_message_id = ?2, html = NULL, plain = NULL,
+            updated_at = ?3 WHERE id = ?1",
+        params![id, message_id, now()],
+    )?;
+    Ok(())
+}
+
+pub fn chunk_use_plain(c: &mut Connection, id: i64) -> Result<()> {
+    c.execute(
+        "UPDATE tg_outbox SET use_plain = 1, updated_at = ?2 WHERE id = ?1",
+        params![id, now()],
+    )?;
+    Ok(())
+}
+
+pub fn chunk_retry(c: &mut Connection, id: i64, attempts: u32, next_at: &str) -> Result<()> {
+    c.execute(
+        "UPDATE tg_outbox SET attempts = ?2, next_attempt_at = ?3, updated_at = ?4 WHERE id = ?1",
+        params![id, attempts, next_at, now()],
+    )?;
+    Ok(())
+}
+
+pub fn chunk_abandon(c: &mut Connection, id: i64) -> Result<()> {
+    c.execute(
+        "UPDATE tg_outbox SET status = 'abandoned', html = NULL, plain = NULL, updated_at = ?2
+         WHERE id = ?1",
+        params![id, now()],
+    )?;
+    Ok(())
+}
+
+pub fn queue_depth(c: &mut Connection) -> Result<u64> {
     let n: i64 = c.query_row(
-        "SELECT COUNT(*) FROM outbox WHERE status IN ('pending', 'in_flight')",
+        "SELECT COUNT(*) FROM tg_outbox WHERE status IN ('pending', 'sending')",
         [],
         |r| r.get(0),
     )?;
     Ok(n.max(0) as u64)
 }
 
-pub fn outbox_set_status(c: &mut Connection, id: i64, status: OutboxStatus) -> Result<()> {
+pub fn chunks(c: &mut Connection) -> Result<Vec<(TgChunk, String)>> {
+    let mut stmt = c.prepare(&format!(
+        "SELECT {CHUNK_COLS}, o.status FROM tg_outbox o LEFT JOIN conversations c
+           ON c.issue_id = o.issue_id ORDER BY o.id"
+    ))?;
+    Ok(stmt
+        .query_map([], |r| Ok((chunk_row(r)?, r.get(10)?)))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+const PC_COLS: &str = "id, chat_id, message_id, update_id, issue_id, client_request_id, body,
+    status, attempts, last_error, comment_id, notified";
+
+fn pc_row(r: &Row<'_>) -> rusqlite::Result<PcEntry> {
+    let status: String = r.get(7)?;
+    Ok(PcEntry {
+        id: r.get(0)?,
+        chat_id: r.get(1)?,
+        message_id: r.get(2)?,
+        update_id: r.get(3)?,
+        issue_id: r.get(4)?,
+        client_request_id: r.get(5)?,
+        body: r.get(6)?,
+        status: PcStatus::parse(&status),
+        attempts: r.get::<_, i64>(8)?.max(0) as u32,
+        last_error: r.get(9)?,
+        comment_id: r.get(10)?,
+        notified: r.get::<_, i64>(11)? != 0,
+    })
+}
+
+pub fn due_messages(c: &mut Connection, now: &str) -> Result<Vec<PcEntry>> {
+    let mut stmt = c.prepare(&format!(
+        "SELECT {PC_COLS} FROM pc_outbox WHERE status = 'pending' AND next_attempt_at <= ?1
+         ORDER BY next_attempt_at, id"
+    ))?;
+    Ok(stmt
+        .query_map([now], pc_row)?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn next_message_due(c: &mut Connection) -> Result<Option<String>> {
+    Ok(c.query_row(
+        "SELECT MIN(next_attempt_at) FROM pc_outbox WHERE status = 'pending'",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+pub fn message_in_flight(c: &mut Connection, id: i64) -> Result<()> {
     c.execute(
-        "UPDATE outbox SET status = ?2, updated_at = ?3 WHERE id = ?1",
-        params![id, status.as_str(), now()],
+        "UPDATE pc_outbox SET status = 'in_flight', updated_at = ?2 WHERE id = ?1",
+        params![id, now()],
     )?;
     Ok(())
 }
 
-pub fn outbox_finish(
+pub fn message_finish(
     c: &mut Connection,
     id: i64,
-    delivery_id: i64,
-    status: OutboxStatus,
-    delivery_status: DeliveryStatus,
-    reason: Option<&str>,
+    status: PcStatus,
+    comment_id: Option<&str>,
+    error: Option<&str>,
 ) -> Result<()> {
-    let tx = c.transaction()?;
-    let ts = now();
-    // The body holds the user's answers: wiped once the entry is finished.
-    tx.execute(
-        "UPDATE outbox SET status = ?2, body_json = NULL, updated_at = ?3 WHERE id = ?1",
-        params![id, status.as_str(), ts],
+    // The body is the user's text: wiped once the entry is finished.
+    c.execute(
+        "UPDATE pc_outbox SET status = ?2, body = NULL, comment_id = COALESCE(?3, comment_id),
+            last_error = COALESCE(?4, last_error), updated_at = ?5 WHERE id = ?1",
+        params![id, status.as_str(), comment_id, error, now()],
     )?;
-    tx.execute(
-        "UPDATE deliveries SET status = ?2, closed_reason = COALESCE(?3, closed_reason), updated_at = ?4
-         WHERE id = ?1",
-        params![delivery_id, delivery_status.as_str(), reason, ts],
-    )?;
-    if matches!(
-        delivery_status,
-        DeliveryStatus::Answered | DeliveryStatus::Closed | DeliveryStatus::Following
-    ) {
-        tx.execute("DELETE FROM drafts WHERE delivery_id = ?1", [delivery_id])?;
-    }
-    tx.commit()?;
     Ok(())
 }
 
-pub fn outbox_remove(
-    c: &mut Connection,
-    id: i64,
-    delivery_id: i64,
-    status: DeliveryStatus,
-) -> Result<()> {
-    let tx = c.transaction()?;
-    tx.execute("DELETE FROM outbox WHERE id = ?1", [id])?;
-    tx.execute(
-        "UPDATE deliveries SET status = ?2, updated_at = ?3 WHERE id = ?1",
-        params![delivery_id, status.as_str(), now()],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-pub fn outbox_retry(
+pub fn message_retry(
     c: &mut Connection,
     id: i64,
     attempts: u32,
     next_at: &str,
     last_error: &str,
+    notified: bool,
 ) -> Result<()> {
     c.execute(
-        "UPDATE outbox SET status = 'pending', attempts = ?2, next_attempt_at = ?3, last_error = ?4,
-                updated_at = ?5 WHERE id = ?1",
-        params![id, attempts as i64, next_at, last_error, now()],
+        "UPDATE pc_outbox SET status = 'pending', attempts = ?2, next_attempt_at = ?3,
+            last_error = ?4, notified = ?5, updated_at = ?6 WHERE id = ?1",
+        params![id, attempts, next_at, last_error, notified as i64, now()],
     )?;
     Ok(())
 }
 
-pub fn is_seen(c: &mut Connection, table: &str, col: &str, id: &str) -> Result<bool> {
-    let mut stmt = c.prepare_cached(&format!("SELECT 1 FROM {table} WHERE {col} = ?1"))?;
-    Ok(stmt.exists([id])?)
+pub fn message(c: &mut Connection, id: i64) -> Result<Option<PcEntry>> {
+    Ok(c.query_row(
+        &format!("SELECT {PC_COLS} FROM pc_outbox WHERE id = ?1"),
+        [id],
+        pc_row,
+    )
+    .optional()?)
 }
 
-pub fn mark_seen(c: &mut Connection, table: &str, col: &str, ids: &[String]) -> Result<()> {
-    let tx = c.transaction()?;
-    {
-        let mut stmt = tx.prepare_cached(&format!(
-            "INSERT OR IGNORE INTO {table}({col}, seen_at) VALUES (?1, ?2)"
-        ))?;
-        let ts = now();
-        for id in ids {
-            stmt.execute(params![id, ts])?;
-        }
-    }
-    tx.commit()?;
-    Ok(())
-}
-
-pub fn purge_seen(c: &mut Connection, before: &str) -> Result<usize> {
-    let tx = c.transaction()?;
-    // seen_done_issues is kept: an old done issue may still be in the feed.
-    let n = tx.execute("DELETE FROM seen_runs WHERE seen_at < ?1", [before])?;
-    tx.commit()?;
-    Ok(n)
+pub fn messages(c: &mut Connection) -> Result<Vec<PcEntry>> {
+    let mut stmt = c.prepare(&format!("SELECT {PC_COLS} FROM pc_outbox ORDER BY id"))?;
+    Ok(stmt
+        .query_map([], pc_row)?
+        .collect::<rusqlite::Result<_>>()?)
 }

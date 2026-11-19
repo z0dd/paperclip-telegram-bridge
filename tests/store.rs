@@ -1,406 +1,374 @@
-//! State store: durability across restarts, exactly-once update effects,
-//! recovery of interrupted work (architecture §3.1, §4.2, §4.3).
+//! State store v2 (ADR-0010 §2.4): migration from v1, atomic commits,
+//! idempotency, recovery after a crash.
 
-use bridge::domain::*;
 use bridge::store::*;
 
-fn interaction(id: &str) -> Interaction {
-    Interaction {
-        id: id.into(),
+fn conversation(issue: &str, watermark: Option<&str>) -> NewConversation {
+    NewConversation {
+        issue_id: issue.into(),
         company_id: "company-1".into(),
-        issue_id: "issue-1".into(),
-        kind: InteractionKind::RequestConfirmation,
-        status: InteractionStatus::Pending,
-        title: Some("t".into()),
-        created_by_agent_id: Some("agent-1".into()),
-        created_at: "2026-11-15T10:00:00.000Z".into(),
-        resolved_by_user_id: None,
-        resolved_by_agent_id: None,
-        addressee_agent_id: None,
-        addressee_user_id: None,
-        body: InteractionBody::Confirmation(Confirmation {
-            prompt: "Ok?".into(),
-            details: None,
-            accept_label: None,
-            reject_label: None,
-            reject_requires_reason: false,
-            allow_decline_reason: false,
-        }),
-        result: None,
+        identifier: Some("PET-4".into()),
+        agent_id: "agent-1".into(),
+        agent_name: "PET Lead".into(),
+        key_ref: "0:abcdef01".into(),
+        watermark_comment_id: watermark.map(str::to_string),
+        updated_at: Some("2026-11-19T10:00:00.000Z".into()),
+        topic_name: "PET · PET Lead".into(),
     }
 }
 
-fn new_delivery(id: &str) -> NewDelivery {
-    NewDelivery {
-        interaction_id: id.into(),
-        company_id: "company-1".into(),
-        issue_id: "issue-1".into(),
-        issue_ref: "PET-1".into(),
-        snapshot: Snapshot {
-            interaction: interaction(id),
-            issue_title: Some("Issue".into()),
-            agent_name: Some("Architect".into()),
-        },
-        status: DeliveryStatus::New,
+fn chunk(comment: &str, i: u32, n: u32) -> NewChunk {
+    NewChunk {
+        comment_id: comment.into(),
+        chunk: i,
+        chunks: n,
+        html: format!("<b>{comment}/{i}</b>"),
+        plain: format!("{comment}/{i}"),
     }
 }
 
-fn accept() -> Resolution {
-    Resolution::Accept {
-        selected_option_ids: None,
+fn message(message_id: i64) -> NewPcEntry {
+    NewPcEntry {
+        chat_id: -100,
+        message_id,
+        issue_id: "issue-1".into(),
+        client_request_id: format!("crid-{message_id}"),
+        body: "secret user text".into(),
     }
+}
+
+async fn open() -> (tempfile::TempDir, Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("bridge.db")).unwrap();
+    store.recover().await.unwrap();
+    (dir, store)
 }
 
 #[tokio::test]
-async fn state_survives_restart() {
+async fn v1_state_is_migrated_and_offset_kept() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bridge.db");
-    let did = {
-        let store = Store::open(&path).unwrap();
-        let did = store
-            .insert_delivery(new_delivery("card-1"))
-            .await
-            .unwrap()
-            .unwrap();
-        store
-            .mark_sent(did, DeliveryStatus::Sent, vec![10, 11])
-            .await
-            .unwrap();
-        let mut draft = Draft::new(did);
-        draft.step = 2;
-        draft.awaiting = Some(Awaiting::Text { question: 2 });
-        draft.answers.form = vec![
-            Some(FormAnswer {
-                option_ids: vec!["a".into()],
-                other_text: None,
-            }),
-            None,
-        ];
-        store
-            .commit_update(7, vec![StoreOp::PutDraft(draft)])
-            .await
-            .unwrap();
-        store.checkpoint().await.unwrap();
-        did
-    };
-    let store = Store::open(&path).unwrap();
-    assert_eq!(store.telegram_offset().await.unwrap(), 8);
-    let d = store.delivery(did).await.unwrap().unwrap();
-    assert_eq!(d.status, DeliveryStatus::Sent);
-    assert_eq!(d.messages, vec![(0, 10), (1, 11)]);
-    assert_eq!(d.last_message_id(), Some(11));
-    assert_eq!(d.snapshot.agent_name.as_deref(), Some("Architect"));
-    assert_eq!(d.snapshot.interaction, interaction("card-1"));
-    let draft = store.draft(did).await.unwrap().unwrap();
-    assert_eq!(draft.step, 2);
-    assert_eq!(draft.awaiting, Some(Awaiting::Text { question: 2 }));
-    assert_eq!(draft.answers.form.len(), 2);
-    assert_eq!(
-        store.delivery_by_message(11).await.unwrap().unwrap().id,
-        did
-    );
-    assert_eq!(
-        store
-            .text_awaiting_draft()
-            .await
-            .unwrap()
-            .unwrap()
-            .delivery_id,
-        did
-    );
-}
-
-#[tokio::test]
-async fn duplicate_update_has_one_effect() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("bridge.db")).unwrap();
-    let did = store
-        .insert_delivery(new_delivery("card-1"))
-        .await
-        .unwrap()
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE deliveries (id INTEGER PRIMARY KEY, interaction_id TEXT);
+             CREATE TABLE delivery_messages (delivery_id INTEGER REFERENCES deliveries(id), chunk INTEGER, message_id INTEGER);
+             CREATE TABLE drafts (delivery_id INTEGER PRIMARY KEY REFERENCES deliveries(id));
+             CREATE TABLE outbox (id INTEGER PRIMARY KEY, delivery_id INTEGER REFERENCES deliveries(id));
+             CREATE TABLE seen_runs (run_id TEXT PRIMARY KEY, seen_at TEXT NOT NULL);
+             CREATE TABLE seen_done_issues (issue_id TEXT PRIMARY KEY, seen_at TEXT NOT NULL);
+             INSERT INTO deliveries VALUES (1, 'card-1');
+             INSERT INTO delivery_messages VALUES (1, 0, 77);
+             INSERT INTO drafts VALUES (1);
+             INSERT INTO outbox VALUES (1, 1);
+             INSERT INTO meta VALUES ('telegram_offset', '4242'), ('self_user_id', 'u'), ('runs_baseline_at', 'x');
+             PRAGMA user_version = 1;",
+        )
         .unwrap();
-    let ops = || {
-        vec![
-            StoreOp::Enqueue {
-                delivery_id: did,
-                resolution: accept(),
-            },
-            StoreOp::BumpGeneration(did),
-        ]
-    };
-    assert_eq!(
-        store.commit_update(100, ops()).await.unwrap(),
-        CommitOutcome::Applied
-    );
-    assert_eq!(
-        store.commit_update(100, ops()).await.unwrap(),
-        CommitOutcome::Duplicate
-    );
-    assert_eq!(
-        store.commit_update(99, ops()).await.unwrap(),
-        CommitOutcome::Duplicate
-    );
-    let d = store.delivery(did).await.unwrap().unwrap();
-    assert_eq!(d.generation, 1, "effects applied once");
-    assert_eq!(d.status, DeliveryStatus::Answering);
-    assert_eq!(store.telegram_offset().await.unwrap(), 101);
-    assert_eq!(store.pending_outbox_count().await.unwrap(), 1);
-}
-
-#[tokio::test]
-async fn at_most_one_outbox_entry_per_card() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("bridge.db")).unwrap();
-    let did = store
-        .insert_delivery(new_delivery("card-1"))
-        .await
-        .unwrap()
-        .unwrap();
-    for uid in [1, 2] {
-        store
-            .commit_update(
-                uid,
-                vec![StoreOp::Enqueue {
-                    delivery_id: did,
-                    resolution: if uid == 1 {
-                        accept()
-                    } else {
-                        Resolution::Reject { reason: None }
-                    },
-                }],
-            )
-            .await
-            .unwrap();
     }
-    let entry = store.outbox_for(did).await.unwrap().unwrap();
-    assert_eq!(entry.resolution, Some(accept()), "first answer wins");
-    assert_eq!(store.pending_outbox_count().await.unwrap(), 1);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.telegram_offset().await.unwrap(), 4242);
+    drop(store);
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let v: i64 = c
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, SCHEMA_VERSION);
+    let tables: Vec<String> = c
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        tables,
+        [
+            "companies",
+            "conversations",
+            "meta",
+            "pc_outbox",
+            "seen_comments",
+            "tg_outbox"
+        ]
+    );
+    let keys: Vec<String> = c
+        .prepare("SELECT key FROM meta ORDER BY key")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(keys, ["telegram_offset"]);
 }
 
 #[tokio::test]
-async fn duplicate_interaction_is_not_inserted_twice() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("bridge.db")).unwrap();
+async fn conversation_is_inserted_once_with_its_watermark_seen() {
+    let (_d, s) = open().await;
     assert!(
-        store
-            .insert_delivery(new_delivery("card-1"))
+        s.insert_conversation(conversation("issue-1", Some("c-0")))
             .await
             .unwrap()
-            .is_some()
     );
     assert!(
-        store
-            .insert_delivery(new_delivery("card-1"))
+        !s.insert_conversation(conversation("issue-1", Some("c-9")))
             .await
             .unwrap()
-            .is_none()
     );
+    let c = s.conversation("issue-1".into()).await.unwrap().unwrap();
+    assert_eq!(c.watermark_comment_id.as_deref(), Some("c-0"));
+    assert_eq!(c.cursor_comment_id.as_deref(), Some("c-0"));
+    assert_eq!(c.topic_state, TopicState::Pending);
+    assert_eq!(c.topic_thread_id, None);
     assert_eq!(
-        store
-            .known_interactions(vec!["card-1".into(), "card-2".into()])
+        s.seen_of("issue-1".into(), vec!["c-0".into(), "c-1".into()])
             .await
             .unwrap(),
-        vec!["card-1"]
+        ["c-0"]
     );
+    // Without comments the cursor starts empty.
+    assert!(
+        s.insert_conversation(conversation("issue-2", None))
+            .await
+            .unwrap()
+    );
+    let c2 = s.conversation("issue-2".into()).await.unwrap().unwrap();
+    assert_eq!(c2.cursor_comment_id, None);
 }
 
 #[tokio::test]
-async fn crash_in_flight_and_sending_are_recovered() {
+async fn topics_are_created_lost_and_recreated() {
+    let (_d, s) = open().await;
+    s.insert_conversation(conversation("issue-1", None))
+        .await
+        .unwrap();
+    let job = s.next_topic_job().await.unwrap().unwrap();
+    assert_eq!(job.issue_id, "issue-1");
+    s.set_topic("issue-1".into(), 101).await.unwrap();
+    assert!(s.next_topic_job().await.unwrap().is_none());
+    let c = s.conversation_by_thread(101).await.unwrap().unwrap();
+    assert_eq!(c.topic_state, TopicState::Active);
+    // A stale "lost" for another thread does nothing.
+    s.topic_lost("issue-1".into(), 99).await.unwrap();
+    assert!(s.next_topic_job().await.unwrap().is_none());
+    s.topic_lost("issue-1".into(), 101).await.unwrap();
+    let job = s.next_topic_job().await.unwrap().unwrap();
+    assert_eq!(job.topic_state, TopicState::Recreating);
+    assert!(s.conversation_by_thread(101).await.unwrap().is_none());
+    // Removed conversations get no topic.
+    s.set_removed("issue-1".into(), Some("2026-11-19T10:00:00.000Z".into()))
+        .await
+        .unwrap();
+    assert!(s.next_topic_job().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn pieces_cursor_and_seen_commit_together_and_keep_order() {
+    let (_d, s) = open().await;
+    s.insert_conversation(conversation("issue-1", Some("c-0")))
+        .await
+        .unwrap();
+    let batch = CommentBatch {
+        issue_id: "issue-1".into(),
+        seen: vec!["c-1".into(), "c-2".into()],
+        chunks: vec![chunk("c-1", 0, 2), chunk("c-1", 1, 2), chunk("c-2", 0, 1)],
+        cursor: Some("c-2".into()),
+        swept_at: "2026-11-19T10:00:00.000Z".into(),
+        hot_until: Some("2099-01-01T00:00:00.000Z".into()),
+    };
+    s.commit_comments(batch.clone()).await.unwrap();
+    // The same batch again (crash before the cursor was read back) adds nothing.
+    s.commit_comments(batch).await.unwrap();
+    assert_eq!(s.queue_depth().await.unwrap(), 3);
+    let c = s.conversation("issue-1".into()).await.unwrap().unwrap();
+    assert_eq!(c.cursor_comment_id.as_deref(), Some("c-2"));
+    assert_eq!(c.hot_until.as_deref(), Some("2099-01-01T00:00:00.000Z"));
+
+    let now = "2099-12-31T00:00:00.000Z".to_string();
+    // No topic yet: nothing to send.
+    assert!(s.next_chunk(now.clone()).await.unwrap().is_none());
+    s.set_topic("issue-1".into(), 101).await.unwrap();
+    let first = s.next_chunk(now.clone()).await.unwrap().unwrap();
+    assert_eq!((first.comment_id.as_str(), first.chunk), ("c-1", 0));
+    assert_eq!(first.thread_id, Some(101));
+    // A piece waiting for retry blocks the later pieces of its conversation.
+    s.chunk_retry(first.id, 1, "2099-12-31T01:00:00.000Z".into())
+        .await
+        .unwrap();
+    assert!(s.next_chunk(now.clone()).await.unwrap().is_none());
+    // The later pieces are due already: the sender wakes up for them.
+    let due = s.next_chunk_due().await.unwrap().unwrap();
+    assert!(due.as_str() < "2099-12-31T01:00:00.000Z", "{due}");
+    s.chunk_retry(first.id, 1, now.clone()).await.unwrap();
+    let again = s.next_chunk(now.clone()).await.unwrap().unwrap();
+    assert_eq!(again.id, first.id);
+    assert_eq!(again.attempts, 1);
+    s.chunk_sent(first.id, 5001).await.unwrap();
+    let second = s.next_chunk(now.clone()).await.unwrap().unwrap();
+    assert_eq!((second.comment_id.as_str(), second.chunk), ("c-1", 1));
+    s.chunk_use_plain(second.id).await.unwrap();
+    let plain = s.next_chunk(now.clone()).await.unwrap().unwrap();
+    assert!(plain.use_plain);
+    s.chunk_abandon(second.id).await.unwrap();
+    let third = s.next_chunk(now.clone()).await.unwrap().unwrap();
+    assert_eq!(third.comment_id, "c-2");
+    s.chunk_sent(third.id, 5002).await.unwrap();
+    assert_eq!(s.queue_depth().await.unwrap(), 0);
+    // Delivered text is not kept.
+    for (c, status) in s.chunks().await.unwrap() {
+        assert!(c.html.is_none() && c.plain.is_none(), "{status}");
+    }
+}
+
+#[tokio::test]
+async fn duplicate_update_queues_one_message_and_offset_moves_once() {
+    let (_d, s) = open().await;
+    assert_eq!(
+        s.enqueue_message(10, message(1)).await.unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(s.telegram_offset().await.unwrap(), 11);
+    assert_eq!(
+        s.enqueue_message(10, message(1)).await.unwrap(),
+        CommitOutcome::Duplicate
+    );
+    // Same Telegram message under a new update id: still one entry.
+    s.enqueue_message(11, message(1)).await.unwrap();
+    assert_eq!(s.messages().await.unwrap().len(), 1);
+    assert_eq!(s.advance_offset(5).await.unwrap(), CommitOutcome::Duplicate);
+    assert_eq!(s.advance_offset(12).await.unwrap(), CommitOutcome::Applied);
+    assert_eq!(s.telegram_offset().await.unwrap(), 13);
+}
+
+#[tokio::test]
+async fn in_flight_message_returns_to_pending_after_a_crash() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bridge.db");
-    let (sending, answered) = {
-        let store = Store::open(&path).unwrap();
-        // Crash after the outbox entry went in flight, before the result commit.
-        let answered = store
-            .insert_delivery(new_delivery("card-1"))
-            .await
-            .unwrap()
-            .unwrap();
-        store
-            .commit_update(
-                1,
-                vec![StoreOp::Enqueue {
-                    delivery_id: answered,
-                    resolution: accept(),
-                }],
-            )
-            .await
-            .unwrap();
-        let e = store.outbox_for(answered).await.unwrap().unwrap();
-        store.outbox_in_flight(e.id).await.unwrap();
-        // Crash between "sending" and the commit of message ids.
-        let sending = store
-            .insert_delivery(new_delivery("card-2"))
-            .await
-            .unwrap()
-            .unwrap();
-        store
-            .set_status(sending, DeliveryStatus::Sending, None)
-            .await
-            .unwrap();
-        (sending, answered)
-        // Store dropped without any cleanup = crash.
-    };
-    let store = Store::open(&path).unwrap();
-    let rec = store.recover().await.unwrap();
-    assert_eq!(rec.outbox_reset, 1);
-    assert_eq!(rec.sending, vec![sending]);
-    let due = store
-        .due_outbox(bridge::timeutil::now_string())
-        .await
-        .unwrap();
-    assert_eq!(due.len(), 1);
-    assert_eq!(due[0].delivery_id, answered);
-    assert_eq!(due[0].status, OutboxStatus::Pending);
-    assert_eq!(due[0].resolution, Some(accept()), "answer is not lost");
-}
-
-#[tokio::test]
-async fn finished_outbox_wipes_body_and_draft() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("bridge.db")).unwrap();
-    let did = store
-        .insert_delivery(new_delivery("card-1"))
+    let s = Store::open(&path).unwrap();
+    s.recover().await.unwrap();
+    s.enqueue_message(1, message(1)).await.unwrap();
+    let e = s
+        .due_messages("2099-01-01T00:00:00.000Z".into())
         .await
         .unwrap()
-        .unwrap();
-    store
-        .commit_update(
-            1,
-            vec![
-                StoreOp::PutDraft(Draft::new(did)),
-                StoreOp::Enqueue {
-                    delivery_id: did,
-                    resolution: Resolution::Reject {
-                        reason: Some("private reason".into()),
-                    },
-                },
-            ],
-        )
-        .await
-        .unwrap();
-    let e = store.outbox_for(did).await.unwrap().unwrap();
-    store
-        .outbox_done(e.id, did, DeliveryStatus::Answered, None)
-        .await
-        .unwrap();
-    let e = store.outbox_for(did).await.unwrap().unwrap();
-    assert_eq!(e.status, OutboxStatus::Done);
-    assert_eq!(e.resolution, None);
-    assert!(store.draft(did).await.unwrap().is_none());
-    assert_eq!(
-        store.delivery(did).await.unwrap().unwrap().status,
-        DeliveryStatus::Answered
-    );
-}
-
-#[tokio::test]
-async fn retry_schedule_and_removal() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("bridge.db")).unwrap();
-    let did = store
-        .insert_delivery(new_delivery("card-1"))
-        .await
-        .unwrap()
-        .unwrap();
-    store
-        .apply(vec![StoreOp::Enqueue {
-            delivery_id: did,
-            resolution: accept(),
-        }])
-        .await
-        .unwrap();
-    let e = store.outbox_for(did).await.unwrap().unwrap();
-    store
-        .outbox_retry(e.id, 3, "2999-01-01T00:00:00Z".into(), "timeout".into())
-        .await
-        .unwrap();
+        .remove(0);
+    s.message_in_flight(e.id).await.unwrap();
     assert!(
-        store
-            .due_outbox(bridge::timeutil::now_string())
+        s.due_messages("2099-01-01T00:00:00.000Z".into())
             .await
             .unwrap()
             .is_empty()
     );
-    assert_eq!(
-        store.next_outbox_due().await.unwrap().as_deref(),
-        Some("2999-01-01T00:00:00Z")
-    );
-    let e = store.outbox_for(did).await.unwrap().unwrap();
-    assert_eq!((e.attempts, e.last_error.as_deref()), (3, Some("timeout")));
-    store
-        .outbox_remove(e.id, did, DeliveryStatus::Sent)
+    drop(s);
+    let s = Store::open(&path).unwrap();
+    let rec = s.recover().await.unwrap();
+    assert_eq!(rec.pc_reset, 1);
+    let e = s
+        .due_messages("2099-01-01T00:00:00.000Z".into())
         .await
-        .unwrap();
-    assert!(store.outbox_for(did).await.unwrap().is_none());
-    assert_eq!(
-        store.delivery(did).await.unwrap().unwrap().status,
-        DeliveryStatus::Sent
-    );
+        .unwrap()
+        .remove(0);
+    assert_eq!(e.status, PcStatus::Pending);
+    assert_eq!(e.body.as_deref(), Some("secret user text"));
 }
 
 #[tokio::test]
-async fn only_one_text_waiting_draft() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("bridge.db")).unwrap();
-    let a = store
-        .insert_delivery(new_delivery("card-1"))
-        .await
-        .unwrap()
-        .unwrap();
-    let b = store
-        .insert_delivery(new_delivery("card-2"))
-        .await
-        .unwrap()
-        .unwrap();
-    let mut da = Draft::new(a);
-    da.awaiting = Some(Awaiting::RejectReason { optional: false });
-    store.apply(vec![StoreOp::PutDraft(da)]).await.unwrap();
-    let mut db = Draft::new(b);
-    db.awaiting = Some(Awaiting::Text { question: 0 });
-    store
-        .apply(vec![
-            StoreOp::PutDraft(db),
-            StoreOp::ClearOtherTextAwaiting { keep: b },
-        ])
+async fn finished_messages_wipe_the_body() {
+    let (_d, s) = open().await;
+    s.enqueue_message(1, message(1)).await.unwrap();
+    s.enqueue_message(2, message(2)).await.unwrap();
+    let due = s
+        .due_messages("2099-01-01T00:00:00.000Z".into())
         .await
         .unwrap();
-    assert_eq!(store.draft(a).await.unwrap().unwrap().awaiting, None);
-    assert_eq!(
-        store
-            .text_awaiting_draft()
-            .await
-            .unwrap()
-            .unwrap()
-            .delivery_id,
-        b
-    );
+    s.message_retry(
+        due[0].id,
+        1,
+        "2099-06-01T00:00:00.000Z".into(),
+        "http_502".into(),
+        true,
+    )
+    .await
+    .unwrap();
+    let e = s.message(due[0].id).await.unwrap().unwrap();
+    assert_eq!((e.attempts, e.notified), (1, true));
+    assert_eq!(e.last_error.as_deref(), Some("http_502"));
+    // The other message is due now, the retried one later.
+    let next = s.next_message_due().await.unwrap().unwrap();
+    assert!(next.as_str() < "2099-06-01T00:00:00.000Z", "{next}");
+    s.message_done(due[0].id, Some("c-5".into())).await.unwrap();
+    s.message_rejected(due[1].id, "http_409".into())
+        .await
+        .unwrap();
+    let all = s.messages().await.unwrap();
+    assert_eq!(all[0].status, PcStatus::Done);
+    assert_eq!(all[0].comment_id.as_deref(), Some("c-5"));
+    assert_eq!(all[1].status, PcStatus::Rejected);
+    assert!(all.iter().all(|e| e.body.is_none()));
 }
 
 #[tokio::test]
-async fn seen_runs_are_tracked_and_purged() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("bridge.db")).unwrap();
-    store
-        .mark_runs_seen(vec!["run-1".into(), "run-2".into()])
+async fn seen_purge_keeps_cursor_and_newest() {
+    let (_d, s) = open().await;
+    s.insert_conversation(conversation("issue-1", Some("c-0")))
         .await
         .unwrap();
-    store.mark_runs_seen(vec!["run-1".into()]).await.unwrap();
-    assert!(store.is_run_seen("run-1".into()).await.unwrap());
-    assert!(!store.is_run_seen("run-3".into()).await.unwrap());
-    store
-        .mark_done_issues_seen(vec!["issue-1".into()])
+    let ids: Vec<String> = (1..=5).map(|i| format!("c-{i}")).collect();
+    s.commit_comments(CommentBatch {
+        issue_id: "issue-1".into(),
+        seen: ids.clone(),
+        cursor: Some("c-5".into()),
+        swept_at: "2026-11-19T10:00:00.000Z".into(),
+        ..CommentBatch::default()
+    })
+    .await
+    .unwrap();
+    // Everything is "old"; keep the newest 2 plus cursor and watermark.
+    let purged = s
+        .purge_seen("2999-01-01T00:00:00.000Z".into(), 2)
         .await
         .unwrap();
+    let mut all = ids.clone();
+    all.insert(0, "c-0".into());
+    let left = s.seen_of("issue-1".into(), all).await.unwrap();
+    assert!(left.contains(&"c-5".to_string()), "{left:?}");
+    assert!(left.contains(&"c-0".to_string()), "{left:?}");
+    assert_eq!(purged + left.len(), 6);
+    // Nothing is older than the cutoff: nothing goes.
     assert_eq!(
-        store
-            .purge_seen("2999-01-01T00:00:00Z".into())
+        s.purge_seen("2000-01-01T00:00:00.000Z".into(), 0)
             .await
             .unwrap(),
-        2
+        0
     );
-    assert!(!store.is_run_seen("run-1".into()).await.unwrap());
-    assert!(store.is_done_issue_seen("issue-1".into()).await.unwrap());
+}
+
+#[tokio::test]
+async fn hot_window_only_grows() {
+    let (_d, s) = open().await;
+    s.insert_conversation(conversation("issue-1", None))
+        .await
+        .unwrap();
+    s.extend_hot("issue-1".into(), "2026-11-19T12:00:00.000Z".into())
+        .await
+        .unwrap();
+    s.extend_hot("issue-1".into(), "2026-11-19T11:00:00.000Z".into())
+        .await
+        .unwrap();
+    s.set_updated_at(
+        "issue-1".into(),
+        Some("2026-11-19T10:30:00.000Z".into()),
+        "2026-11-19T10:40:00.000Z".into(),
+    )
+    .await
+    .unwrap();
+    let c = s.conversation("issue-1".into()).await.unwrap().unwrap();
+    assert_eq!(c.hot_until.as_deref(), Some("2026-11-19T12:00:00.000Z"));
+    assert_eq!(
+        c.last_updated_at.as_deref(),
+        Some("2026-11-19T10:30:00.000Z")
+    );
 }
 
 #[tokio::test]

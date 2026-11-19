@@ -19,7 +19,39 @@ pub enum ConfigError {
     Invalid { var: &'static str, reason: String },
     #[error("{var}: secret file {reason}")]
     SecretFile { var: &'static str, reason: String },
+    /// A v1 variable whose meaning cannot be carried over (ADR-0010 §2.7).
+    #[error("{var} is no longer supported in v2: {hint}")]
+    Removed {
+        var: &'static str,
+        hint: &'static str,
+    },
 }
+
+/// v1 variables that stop the start: silently ignoring them would change
+/// who can talk to the bridge or which companies it serves.
+pub const REMOVED_VARS: [(&str, &str); 2] = [
+    (
+        "PAPERCLIP_COMPANY_IDS",
+        "companies are discovered automatically, remove the variable",
+    ),
+    (
+        "TELEGRAM_USER_ID",
+        "use TELEGRAM_ALLOWED_USER_IDS (comma-separated Telegram user ids) and set TELEGRAM_CHAT_ID to the forum supergroup",
+    ),
+];
+
+/// v1 variables without a v2 meaning: a WARN at start, nothing else.
+pub const IGNORED_VARS: [&str; 9] = [
+    "PAPERCLIP_RUNS_POLL_INTERVAL",
+    "PAPERCLIP_GOVERNED_TIMEOUT",
+    "GOVERNED_APPROVALS_ENABLED",
+    "GOVERNED_DESTRUCTIVE_MODE",
+    "GOVERNED_SHOW_ARGUMENTS",
+    "GOVERNED_RESULT_FOLLOW",
+    "NOTIFY_RESOLVED_ELSEWHERE",
+    "NOTIFY_RUN_FAILURES",
+    "NOTIFY_TASK_COMPLETED",
+];
 
 /// Proxy URL for Telegram. May contain credentials, so it is kept secret and
 /// only the scheme is ever printed.
@@ -67,12 +99,6 @@ impl fmt::Debug for ProxyUrl {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DestructiveMode {
-    Confirm,
-    UiOnly,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
     Json,
     Text,
@@ -81,27 +107,34 @@ pub enum LogFormat {
 #[derive(Debug, Clone)]
 pub struct PaperclipConfig {
     pub url: Url,
-    pub token: SecretString,
-    pub company_ids: Vec<String>,
+    /// One board key (`PAPERCLIP_TOKEN_FILE`) or several (`PAPERCLIP_TOKEN_FILES`),
+    /// in configuration order (ADR-0010 §1.1).
+    pub tokens: Vec<SecretString>,
     pub ui_url: Option<Url>,
+    /// `/chats` of every company and hot conversations.
     pub poll_interval: Duration,
-    pub runs_poll_interval: Duration,
+    /// Company list and agent names.
+    pub discovery_interval: Duration,
+    /// Safety read of cold conversations.
+    pub sweep_interval: Duration,
     pub request_timeout: Duration,
-    pub governed_timeout: Duration,
     pub connect_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
 pub struct TelegramConfig {
     pub token: SecretString,
+    /// The forum supergroup (`-100…`).
     pub chat_id: i64,
-    pub user_id: i64,
+    pub allowed_user_ids: Vec<i64>,
     /// Mandatory: there is no code path that talks to Telegram without it.
     pub proxy: ProxyUrl,
     pub api_base: Url,
     pub long_poll_timeout: Duration,
     pub request_timeout: Duration,
     pub connect_timeout: Duration,
+    /// Pause between chat-changing calls: 20 messages a minute per group.
+    pub group_min_interval: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -112,21 +145,6 @@ pub struct RetryConfig {
     pub notify_after: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct NotifyConfig {
-    pub run_failures: bool,
-    pub task_completed: bool,
-    pub resolved_elsewhere: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct GovernedConfig {
-    pub enabled: bool,
-    pub destructive_mode: DestructiveMode,
-    pub show_arguments: bool,
-    pub result_follow: Duration,
-}
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub paperclip: PaperclipConfig,
@@ -134,11 +152,14 @@ pub struct Config {
     pub state_path: PathBuf,
     pub health: HealthConfig,
     pub retry: RetryConfig,
-    pub notify: NotifyConfig,
-    pub governed: GovernedConfig,
+    /// A conversation stays "hot" (comments read every poll) this long after
+    /// any activity (ADR-0010 §2.3).
+    pub hot_window: Duration,
     pub max_message_chunks: usize,
     pub shutdown_grace: Duration,
     pub log: LogConfig,
+    /// Variables of v1 that are set but no longer used (WARN at start).
+    pub ignored_vars: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,7 +197,7 @@ impl<'a> Env<'a> {
 
     fn duration(&self, var: &'static str, default: &str) -> Result<Duration, ConfigError> {
         let raw = self.get(var).unwrap_or(default);
-        let d = humantime::parse_duration(raw).map_err(|_| ConfigError::Invalid {
+        let d = parse_duration(raw).ok_or_else(|| ConfigError::Invalid {
             var,
             reason: "expected a duration like 15s or 2m".into(),
         })?;
@@ -187,18 +208,6 @@ impl<'a> Env<'a> {
             });
         }
         Ok(d)
-    }
-
-    fn boolean(&self, var: &'static str, default: bool) -> Result<bool, ConfigError> {
-        match self.get(var).map(str::to_ascii_lowercase).as_deref() {
-            None => Ok(default),
-            Some("true" | "1" | "yes") => Ok(true),
-            Some("false" | "0" | "no") => Ok(false),
-            Some(_) => Err(ConfigError::Invalid {
-                var,
-                reason: "expected true or false".into(),
-            }),
-        }
     }
 
     fn uint(&self, var: &'static str, default: u32, min: u32) -> Result<u32, ConfigError> {
@@ -227,6 +236,28 @@ impl<'a> Env<'a> {
             })
     }
 
+    fn id_list(&self, var: &'static str) -> Result<Vec<i64>, ConfigError> {
+        let ids = self
+            .required(var)?
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<i64>().map_err(|_| ConfigError::Invalid {
+                    var,
+                    reason: "expected a comma-separated list of integer ids".into(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.is_empty() {
+            return Err(ConfigError::Invalid {
+                var,
+                reason: "expected at least one id".into(),
+            });
+        }
+        Ok(ids)
+    }
+
     fn http_url(&self, var: &'static str, raw: &str) -> Result<Url, ConfigError> {
         let url = Url::parse(raw).map_err(|_| ConfigError::Invalid {
             var,
@@ -245,6 +276,81 @@ impl<'a> Env<'a> {
         let path = self.required(var)?;
         read_secret_file(var, Path::new(path))
     }
+
+    /// `PAPERCLIP_TOKEN_FILE` (option A) or `PAPERCLIP_TOKEN_FILES` (option B),
+    /// never both (ADR-0010 §1.1).
+    fn paperclip_tokens(&self) -> Result<Vec<SecretString>, ConfigError> {
+        const ONE: &str = "PAPERCLIP_TOKEN_FILE";
+        const MANY: &str = "PAPERCLIP_TOKEN_FILES";
+        match (self.get(ONE), self.get(MANY)) {
+            (Some(_), Some(_)) => Err(ConfigError::Invalid {
+                var: MANY,
+                reason: format!("must not be set together with {ONE}"),
+            }),
+            (Some(_), None) => Ok(vec![self.secret_file(ONE)?]),
+            (None, Some(list)) => {
+                let paths: Vec<&str> = list
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .collect();
+                if paths.is_empty() {
+                    return Err(ConfigError::Invalid {
+                        var: MANY,
+                        reason: "expected a comma-separated list of file paths".into(),
+                    });
+                }
+                let mut seen = std::collections::HashSet::new();
+                let mut tokens = Vec::with_capacity(paths.len());
+                for p in paths {
+                    if !seen.insert(p) {
+                        return Err(ConfigError::Invalid {
+                            var: MANY,
+                            reason: "the same file is listed twice".into(),
+                        });
+                    }
+                    tokens.push(read_secret_file(MANY, Path::new(p))?);
+                }
+                Ok(tokens)
+            }
+            (None, None) => Err(ConfigError::Missing(ONE)),
+        }
+    }
+}
+
+/// `500ms`, `15s`, `2m`, `1h`, `1d` and sums like `1h 30m`. The units of
+/// humantime that the configuration documents; replaces the unmaintained crate.
+pub fn parse_duration(raw: &str) -> Option<Duration> {
+    let mut total = Duration::ZERO;
+    let mut rest = raw.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digits == 0 {
+            return None;
+        }
+        let n: u64 = rest[..digits].parse().ok()?;
+        rest = rest[digits..].trim_start();
+        let unit_len = rest
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(rest.len());
+        let unit = &rest[..unit_len];
+        let one = match unit {
+            "ms" | "msec" => Duration::from_millis(1),
+            "s" | "sec" | "secs" => Duration::from_secs(1),
+            "m" | "min" | "mins" => Duration::from_secs(60),
+            "h" | "hr" | "hrs" | "hour" | "hours" => Duration::from_secs(3600),
+            "d" | "day" | "days" => Duration::from_secs(86_400),
+            _ => return None,
+        };
+        total = total.checked_add(one.checked_mul(u32::try_from(n).ok()?)?)?;
+        rest = rest[unit_len..].trim_start();
+    }
+    Some(total)
 }
 
 pub fn read_secret_file(var: &'static str, path: &Path) -> Result<SecretString, ConfigError> {
@@ -275,6 +381,11 @@ impl Config {
     }
 
     pub fn from_env(env: &Env<'_>) -> Result<Self, ConfigError> {
+        for (var, hint) in REMOVED_VARS {
+            if env.get(var).is_some() {
+                return Err(ConfigError::Removed { var, hint });
+            }
+        }
         // Proxy first: without it nothing else matters (architecture §5.1).
         let proxy = ProxyUrl::parse(env.required("TELEGRAM_PROXY_URL")?).map_err(|reason| {
             ConfigError::Invalid {
@@ -288,27 +399,6 @@ impl Config {
             Some(raw) => Some(env.http_url("PAPERCLIP_UI_URL", raw)?),
             None => None,
         };
-        let company_ids: Vec<String> = env
-            .required("PAPERCLIP_COMPANY_IDS")?
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if company_ids.is_empty() {
-            return Err(ConfigError::Invalid {
-                var: "PAPERCLIP_COMPANY_IDS",
-                reason: "expected a comma-separated list of company ids".into(),
-            });
-        }
-        if company_ids.iter().any(|id| {
-            !id.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        }) {
-            return Err(ConfigError::Invalid {
-                var: "PAPERCLIP_COMPANY_IDS",
-                reason: "ids may contain only letters, digits, '-' and '_'".into(),
-            });
-        }
 
         let api_base = env.http_url(
             "TELEGRAM_API_BASE_URL",
@@ -325,20 +415,13 @@ impl Config {
         }
         let connect_timeout = env.duration("CONNECT_TIMEOUT", "10s")?;
 
-        let destructive_mode = match env
-            .get("GOVERNED_DESTRUCTIVE_MODE")
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            None | Some("confirm") => DestructiveMode::Confirm,
-            Some("ui_only") => DestructiveMode::UiOnly,
-            Some(_) => {
-                return Err(ConfigError::Invalid {
-                    var: "GOVERNED_DESTRUCTIVE_MODE",
-                    reason: "expected confirm or ui_only".into(),
-                });
-            }
-        };
+        let chat_id = env.int_id("TELEGRAM_CHAT_ID")?;
+        if chat_id >= 0 {
+            return Err(ConfigError::Invalid {
+                var: "TELEGRAM_CHAT_ID",
+                reason: "expected the id of a supergroup (negative, -100…)".into(),
+            });
+        }
 
         let level = match env.get("LOG_LEVEL").map(str::to_ascii_lowercase).as_deref() {
             None | Some("info") => tracing::Level::INFO,
@@ -383,42 +466,36 @@ impl Config {
         Ok(Config {
             paperclip: PaperclipConfig {
                 url: paperclip_url,
-                token: env.secret_file("PAPERCLIP_TOKEN_FILE")?,
-                company_ids,
+                tokens: env.paperclip_tokens()?,
                 ui_url,
-                poll_interval: env.duration("PAPERCLIP_POLL_INTERVAL", "15s")?,
-                runs_poll_interval: env.duration("PAPERCLIP_RUNS_POLL_INTERVAL", "60s")?,
+                poll_interval: env.duration("PAPERCLIP_POLL_INTERVAL", "5s")?,
+                discovery_interval: env.duration("PAPERCLIP_DISCOVERY_INTERVAL", "60s")?,
+                sweep_interval: env.duration("PAPERCLIP_SWEEP_INTERVAL", "60s")?,
                 request_timeout: env.duration("PAPERCLIP_REQUEST_TIMEOUT", "15s")?,
-                governed_timeout: env.duration("PAPERCLIP_GOVERNED_TIMEOUT", "120s")?,
                 connect_timeout,
             },
             telegram: TelegramConfig {
                 token: env.secret_file("TELEGRAM_BOT_TOKEN_FILE")?,
-                chat_id: env.int_id("TELEGRAM_CHAT_ID")?,
-                user_id: env.int_id("TELEGRAM_USER_ID")?,
+                chat_id,
+                allowed_user_ids: env.id_list("TELEGRAM_ALLOWED_USER_IDS")?,
                 proxy,
                 api_base,
                 long_poll_timeout,
                 request_timeout: env.duration("TELEGRAM_REQUEST_TIMEOUT", "15s")?,
                 connect_timeout,
+                group_min_interval: env.duration("TELEGRAM_GROUP_MIN_INTERVAL", "3s")?,
             },
             state_path: PathBuf::from(env.get("STATE_PATH").unwrap_or("/state/bridge.db")),
             health: HealthConfig::from_env(env)?,
             retry,
-            notify: NotifyConfig {
-                run_failures: env.boolean("NOTIFY_RUN_FAILURES", true)?,
-                task_completed: env.boolean("NOTIFY_TASK_COMPLETED", false)?,
-                resolved_elsewhere: env.boolean("NOTIFY_RESOLVED_ELSEWHERE", true)?,
-            },
-            governed: GovernedConfig {
-                enabled: env.boolean("GOVERNED_APPROVALS_ENABLED", true)?,
-                destructive_mode,
-                show_arguments: env.boolean("GOVERNED_SHOW_ARGUMENTS", false)?,
-                result_follow: env.duration("GOVERNED_RESULT_FOLLOW", "30m")?,
-            },
+            hot_window: env.duration("CONVERSATION_HOT_WINDOW", "10m")?,
             max_message_chunks: env.uint("MAX_MESSAGE_CHUNKS", 3, 1)? as usize,
             shutdown_grace: env.duration("SHUTDOWN_GRACE", "10s")?,
             log: LogConfig { level, format },
+            ignored_vars: IGNORED_VARS
+                .into_iter()
+                .filter(|v| env.get(v).is_some())
+                .collect(),
         })
     }
 }
@@ -434,7 +511,8 @@ impl HealthConfig {
     }
 }
 
-/// Minimal config for `bridge revoke-paperclip-key`.
+/// Minimal config for `bridge revoke-paperclip-key`: one key, from
+/// `PAPERCLIP_TOKEN_FILE` (with option B, point it at the key to revoke).
 pub struct RevokeConfig {
     pub url: Url,
     pub token: SecretString,
@@ -459,7 +537,7 @@ mod tests {
     use std::io::Write;
 
     struct Fixture {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         vars: HashMap<String, String>,
     }
 
@@ -472,9 +550,8 @@ mod tests {
         let mut vars = HashMap::new();
         for (k, v) in [
             ("PAPERCLIP_URL", "http://paperclip.internal:3100"),
-            ("PAPERCLIP_COMPANY_IDS", "company-a, company-b"),
-            ("TELEGRAM_CHAT_ID", "123456789"),
-            ("TELEGRAM_USER_ID", "123456789"),
+            ("TELEGRAM_CHAT_ID", "-1001234567890"),
+            ("TELEGRAM_ALLOWED_USER_IDS", "123456789"),
             ("TELEGRAM_PROXY_URL", "socks5h://xray:1080"),
         ] {
             vars.insert(k.to_string(), v.to_string());
@@ -487,7 +564,7 @@ mod tests {
             "TELEGRAM_BOT_TOKEN_FILE".into(),
             tg.to_string_lossy().into_owned(),
         );
-        Fixture { _dir: dir, vars }
+        Fixture { dir, vars }
     }
 
     fn parse(vars: &HashMap<String, String>) -> Result<Config, ConfigError> {
@@ -498,22 +575,96 @@ mod tests {
     fn parses_minimal_config_with_defaults() {
         let f = fixture();
         let c = parse(&f.vars).unwrap();
-        assert_eq!(c.paperclip.company_ids, vec!["company-a", "company-b"]);
-        assert_eq!(c.paperclip.poll_interval, Duration::from_secs(15));
-        assert_eq!(c.paperclip.governed_timeout, Duration::from_secs(120));
+        assert_eq!(c.paperclip.tokens.len(), 1);
+        assert_eq!(c.paperclip.poll_interval, Duration::from_secs(5));
+        assert_eq!(c.paperclip.discovery_interval, Duration::from_secs(60));
+        assert_eq!(c.paperclip.sweep_interval, Duration::from_secs(60));
+        assert_eq!(c.hot_window, Duration::from_secs(600));
+        assert_eq!(c.telegram.chat_id, -1001234567890);
+        assert_eq!(c.telegram.allowed_user_ids, vec![123456789]);
+        assert_eq!(c.telegram.group_min_interval, Duration::from_secs(3));
         assert_eq!(c.telegram.long_poll_timeout, Duration::from_secs(25));
         assert_eq!(c.telegram.api_base.as_str(), "https://api.telegram.org/");
         assert_eq!(c.telegram.proxy.scheme(), "socks5h");
-        assert_eq!(c.governed.destructive_mode, DestructiveMode::Confirm);
-        assert!(c.governed.enabled);
-        assert!(!c.governed.show_arguments);
-        assert!(c.notify.run_failures);
-        assert!(!c.notify.task_completed);
         assert_eq!(c.max_message_chunks, 3);
         assert_eq!(c.state_path, PathBuf::from("/state/bridge.db"));
         assert_eq!(c.health.max_stale, Duration::from_secs(300));
         assert!(c.paperclip.ui_url.is_none());
-        assert_eq!(c.paperclip.token.expose_secret(), "pcp_board_placeholder");
+        assert!(c.ignored_vars.is_empty());
+        assert_eq!(
+            c.paperclip.tokens[0].expose_secret(),
+            "pcp_board_placeholder"
+        );
+    }
+
+    #[test]
+    fn several_keys_and_users() {
+        let mut f = fixture();
+        let second = f.dir.path().join("pc2");
+        std::fs::write(&second, "pcp_second_placeholder").unwrap();
+        let first = f.vars.remove("PAPERCLIP_TOKEN_FILE").unwrap();
+        f.vars.insert(
+            "PAPERCLIP_TOKEN_FILES".into(),
+            format!("{first}, {}", second.to_string_lossy()),
+        );
+        f.vars
+            .insert("TELEGRAM_ALLOWED_USER_IDS".into(), "1, 22 ,333".into());
+        let c = parse(&f.vars).unwrap();
+        let keys: Vec<&str> = c
+            .paperclip
+            .tokens
+            .iter()
+            .map(|t| t.expose_secret())
+            .collect();
+        assert_eq!(keys, ["pcp_board_placeholder", "pcp_second_placeholder"]);
+        assert_eq!(c.telegram.allowed_user_ids, vec![1, 22, 333]);
+    }
+
+    #[test]
+    fn key_variables_are_mutually_exclusive() {
+        let mut f = fixture();
+        let one = f.vars["PAPERCLIP_TOKEN_FILE"].clone();
+        f.vars.insert("PAPERCLIP_TOKEN_FILES".into(), one.clone());
+        let err = parse(&f.vars).unwrap_err();
+        assert!(err.to_string().contains("PAPERCLIP_TOKEN_FILE"), "{err}");
+        f.vars.remove("PAPERCLIP_TOKEN_FILE");
+        f.vars
+            .insert("PAPERCLIP_TOKEN_FILES".into(), format!("{one},{one}"));
+        assert!(parse(&f.vars).unwrap_err().to_string().contains("twice"));
+        f.vars.remove("PAPERCLIP_TOKEN_FILES");
+        assert_eq!(
+            parse(&f.vars).unwrap_err(),
+            ConfigError::Missing("PAPERCLIP_TOKEN_FILE")
+        );
+    }
+
+    #[test]
+    fn removed_v1_variables_stop_the_start_with_a_hint() {
+        for (var, hint) in [
+            ("PAPERCLIP_COMPANY_IDS", "discovered automatically"),
+            ("TELEGRAM_USER_ID", "TELEGRAM_ALLOWED_USER_IDS"),
+        ] {
+            let mut f = fixture();
+            f.vars.insert(var.into(), "123".into());
+            let err = parse(&f.vars).unwrap_err();
+            assert!(matches!(err, ConfigError::Removed { .. }), "{err}");
+            let text = err.to_string();
+            assert!(text.contains(var) && text.contains(hint), "{text}");
+        }
+    }
+
+    #[test]
+    fn obsolete_v1_variables_are_only_reported() {
+        let mut f = fixture();
+        f.vars
+            .insert("NOTIFY_RUN_FAILURES".into(), "not-a-bool".into());
+        f.vars
+            .insert("GOVERNED_DESTRUCTIVE_MODE".into(), "ui_only".into());
+        let c = parse(&f.vars).unwrap();
+        assert_eq!(
+            c.ignored_vars,
+            vec!["GOVERNED_DESTRUCTIVE_MODE", "NOTIFY_RUN_FAILURES"]
+        );
     }
 
     #[test]
@@ -620,16 +771,19 @@ mod tests {
         let cases = [
             ("PAPERCLIP_POLL_INTERVAL", "soon"),
             ("PAPERCLIP_POLL_INTERVAL", "0s"),
+            ("PAPERCLIP_DISCOVERY_INTERVAL", "never"),
+            ("PAPERCLIP_SWEEP_INTERVAL", "0s"),
+            ("CONVERSATION_HOT_WINDOW", "hot"),
+            ("TELEGRAM_GROUP_MIN_INTERVAL", "fast"),
             ("TELEGRAM_LONG_POLL_TIMEOUT", "60s"),
             ("TELEGRAM_CHAT_ID", "me"),
-            ("GOVERNED_DESTRUCTIVE_MODE", "yolo"),
-            ("NOTIFY_RUN_FAILURES", "maybe"),
+            ("TELEGRAM_CHAT_ID", "123456789"),
+            ("TELEGRAM_ALLOWED_USER_IDS", " , "),
+            ("TELEGRAM_ALLOWED_USER_IDS", "1,me"),
             ("LOG_LEVEL", "trace"),
             ("LOG_FORMAT", "xml"),
             ("MAX_MESSAGE_CHUNKS", "0"),
             ("PAPERCLIP_URL", "ftp://paperclip"),
-            ("PAPERCLIP_COMPANY_IDS", " , "),
-            ("PAPERCLIP_COMPANY_IDS", "a/b"),
             ("RETRY_MAX_DELAY", "100ms"),
         ];
         for (var, value) in cases {
@@ -641,26 +795,47 @@ mod tests {
     }
 
     #[test]
+    fn durations() {
+        for (raw, ms) in [
+            ("500ms", 500),
+            ("15s", 15_000),
+            ("2m", 120_000),
+            ("1h", 3_600_000),
+            ("1d", 86_400_000),
+            ("1h 30m", 5_400_000),
+            ("1m30s", 90_000),
+            (" 10min ", 600_000),
+        ] {
+            assert_eq!(
+                parse_duration(raw),
+                Some(Duration::from_millis(ms)),
+                "{raw}"
+            );
+        }
+        for bad in ["", "15", "s", "1.5s", "-1s", "15x", "soon", "1 s s"] {
+            assert_eq!(parse_duration(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
     fn optional_values_are_parsed() {
         let mut f = fixture();
         for (k, v) in [
-            ("GOVERNED_DESTRUCTIVE_MODE", "ui_only"),
-            ("GOVERNED_APPROVALS_ENABLED", "false"),
-            ("GOVERNED_SHOW_ARGUMENTS", "true"),
             ("PAPERCLIP_UI_URL", "https://paperclip.example"),
             ("LOG_FORMAT", "text"),
             ("LOG_LEVEL", "debug"),
             ("PAPERCLIP_POLL_INTERVAL", "2m"),
+            ("CONVERSATION_HOT_WINDOW", "1h"),
+            ("TELEGRAM_GROUP_MIN_INTERVAL", "500ms"),
             ("BRIDGE_UNKNOWN", "ignored"),
         ] {
             f.vars.insert(k.into(), v.into());
         }
         let c = parse(&f.vars).unwrap();
-        assert_eq!(c.governed.destructive_mode, DestructiveMode::UiOnly);
-        assert!(!c.governed.enabled);
-        assert!(c.governed.show_arguments);
         assert!(c.paperclip.ui_url.is_some());
         assert_eq!(c.log.format, LogFormat::Text);
         assert_eq!(c.paperclip.poll_interval, Duration::from_secs(120));
+        assert_eq!(c.hot_window, Duration::from_secs(3600));
+        assert_eq!(c.telegram.group_min_interval, Duration::from_millis(500));
     }
 }

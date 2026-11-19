@@ -72,11 +72,10 @@ echo "✓ Config.ExposedPorts = null (no exposed ports)"
 
 COMMON_ENV=(
     -e PAPERCLIP_URL="http://127.0.0.1:9"
-    -e PAPERCLIP_COMPANY_IDS="test-company"
     -e PAPERCLIP_TOKEN_FILE="/secrets/pc"
     -e TELEGRAM_BOT_TOKEN_FILE="/secrets/tg"
-    -e TELEGRAM_CHAT_ID="111"
-    -e TELEGRAM_USER_ID="111"
+    -e TELEGRAM_CHAT_ID="-1001234567890"
+    -e TELEGRAM_ALLOWED_USER_IDS="111"
     -e TELEGRAM_PROXY_URL="http://127.0.0.1:9"
     -e STATE_PATH="/state/bridge.db"
     -e HEALTH_FILE="/state/health.json"

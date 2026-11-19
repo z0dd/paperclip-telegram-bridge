@@ -1,35 +1,37 @@
-//! Bridge logic: sync, dialog, outbox, governed, runs, commands.
-//! Depends on `domain`, `store`, `render` and the API traits only.
+//! Bridge logic (ADR-0010 §2.2): discovery, outbound, sender and topics,
+//! inbound, pc_outbox, start checks. Depends on `domain`, `store`, `render`
+//! and the API traits only.
 
 pub mod allowlist;
-pub mod cards;
-pub mod commands;
-pub mod dialog;
-pub mod forms;
-pub mod governed;
+pub mod checks;
+pub mod discovery;
+pub mod inbound;
+pub mod outbound;
 pub mod outbox;
 pub mod poller;
-pub mod runs;
 pub mod sender;
-pub mod sync;
+pub mod topics;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::Duration;
 
-use time::OffsetDateTime;
-use tokio::sync::Notify;
+use secrecy::ExposeSecret;
+use sha2::{Digest, Sha256};
+use tokio::sync::{Notify, mpsc};
 
 use crate::config::Config;
-use crate::domain::RunFailure;
 use crate::health::HealthTracker;
 use crate::paperclip::{PaperclipApi, PaperclipError};
 use crate::render::RenderConfig;
 use crate::store::{Store, StoreError};
 use crate::telegram::{TelegramApi, TelegramError};
+use crate::timeutil;
 
 use allowlist::Allowlist;
-use sender::TgSender;
+
+/// Retry interval after `401` from Paperclip and `403` from Telegram.
+pub const AUTH_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -46,41 +48,52 @@ pub enum CoreError {
 
 pub type Result<T> = std::result::Result<T, CoreError>;
 
-/// Paperclip availability as seen by the bridge (architecture §7.4).
-#[derive(Debug, Default)]
-pub struct PaperclipState {
-    pub consecutive_failures: u32,
-    pub down_since: Option<OffsetDateTime>,
-    pub down_notified: bool,
-    pub auth_failed: bool,
-    pub auth_notified: bool,
+/// A bridge message for the group: to a topic or to General (`None`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub thread_id: Option<i64>,
+    pub html: String,
 }
 
-/// (fetched at, agent id → name)
-pub type AgentNames = (Instant, HashMap<String, String>);
+/// `<index>:<first 8 hex of sha256(key)>` (ADR-0010 §1.1). The key itself is
+/// never stored.
+pub fn key_ref(index: usize, token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("{index}:{hex}")
+}
+
+#[derive(Debug, Default)]
+pub struct KeyState {
+    pub rejected: bool,
+    pub notified: bool,
+}
 
 #[derive(Default)]
 pub struct Shared {
-    /// company → (fetched at, agent id → name)
-    pub agents: Mutex<HashMap<String, AgentNames>>,
-    /// issue → last seen activity signature in the attention feed
-    pub issue_activity: Mutex<HashMap<String, String>>,
-    /// issue id → (identifier, title)
-    pub issues: Mutex<HashMap<String, (String, Option<String>)>>,
-    /// failed_run items of the attention feed, consumed by `runs`
-    pub failed_runs: Mutex<Vec<RunFailure>>,
-    pub paperclip: Mutex<PaperclipState>,
-    /// user id of the board key owner, learned from our own answers
-    pub self_user_id: Mutex<Option<String>>,
+    /// company → agent id → name, refreshed by discovery.
+    pub agents: Mutex<HashMap<String, HashMap<String, String>>>,
+    /// Per configured key.
+    pub keys: Mutex<Vec<KeyState>>,
+    /// `404 Agent Chat is disabled` was told to General.
+    pub agent_chat_notified: Mutex<bool>,
+    /// Paperclip user that owns the conversations (`conversationUserId`) and
+    /// the key that saw it first.
+    pub owner: Mutex<Option<(String, usize)>>,
 }
 
 pub struct Bridge<P, T> {
     pub cfg: Arc<Config>,
-    pub paperclip: Arc<P>,
+    /// One client per board key, in configuration order.
+    pub keys: Vec<Arc<P>>,
+    pub key_refs: Vec<String>,
     pub telegram: Arc<T>,
     pub store: Store,
-    pub tg: TgSender,
     pub health: Arc<HealthTracker>,
+    notices: mpsc::UnboundedSender<Notice>,
+    /// Wakes the sender: new topic, new pieces, a notice.
+    pub sender_notify: Arc<Notify>,
+    /// Wakes the pc_outbox.
     pub outbox_notify: Arc<Notify>,
     pub allowlist: Allowlist,
     pub render: RenderConfig,
@@ -90,124 +103,163 @@ pub struct Bridge<P, T> {
 pub type Ctx<P, T> = Arc<Bridge<P, T>>;
 
 impl<P: PaperclipApi, T: TelegramApi> Bridge<P, T> {
+    /// Returns the context and the notice queue for [`sender::Sender`].
     pub fn new(
         cfg: Arc<Config>,
-        paperclip: Arc<P>,
+        keys: Vec<Arc<P>>,
         telegram: Arc<T>,
         store: Store,
-        tg: TgSender,
         health: Arc<HealthTracker>,
-    ) -> Ctx<P, T> {
+    ) -> (Ctx<P, T>, mpsc::UnboundedReceiver<Notice>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let key_refs = cfg
+            .paperclip
+            .tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| key_ref(i, t.expose_secret()))
+            .collect();
         let render = RenderConfig {
             max_chunks: cfg.max_message_chunks,
             ui_url: cfg.paperclip.ui_url.clone(),
-            governed: cfg.governed,
         };
-        Arc::new(Self {
-            allowlist: Allowlist::new(cfg.telegram.chat_id, cfg.telegram.user_id),
+        let shared = Shared {
+            keys: Mutex::new((0..keys.len()).map(|_| KeyState::default()).collect()),
+            ..Shared::default()
+        };
+        let ctx = Arc::new(Self {
+            allowlist: Allowlist::new(cfg.telegram.chat_id, cfg.telegram.allowed_user_ids.clone()),
             cfg,
-            paperclip,
+            keys,
+            key_refs,
             telegram,
             store,
-            tg,
             health,
+            notices: tx,
+            sender_notify: Arc::new(Notify::new()),
             outbox_notify: Arc::new(Notify::new()),
             render,
-            shared: Shared::default(),
-        })
+            shared,
+        });
+        (ctx, rx)
     }
 
-    pub fn self_user_id(&self) -> Option<String> {
-        self.shared.self_user_id.lock().ok()?.clone()
+    /// Queues a message for the group (best effort, not persisted).
+    pub fn notify(&self, thread_id: Option<i64>, html: impl Into<String>) {
+        let _ = self.notices.send(Notice {
+            thread_id,
+            html: html.into(),
+        });
+        self.sender_notify.notify_one();
     }
 
-    pub async fn learn_self_user_id(&self, id: &str) {
-        let known = self
-            .shared
-            .self_user_id
-            .lock()
-            .map(|g| g.as_deref() == Some(id))
-            .unwrap_or(true);
-        if known {
-            return;
+    /// Index of the key a conversation or company was found with: by the
+    /// key hash, then by position; the first key otherwise.
+    pub fn key_index(&self, key_ref: &str) -> usize {
+        if let Some(i) = self.key_refs.iter().position(|r| r == key_ref) {
+            return i;
         }
-        if let Ok(mut g) = self.shared.self_user_id.lock() {
-            *g = Some(id.to_string());
-        }
-        let _ = self
-            .store
-            .set_meta(crate::store::meta::SELF_USER_ID, id.to_string())
-            .await;
-    }
-
-    pub async fn load_persisted(&self) -> Result<()> {
-        if let Some(id) = self
-            .store
-            .get_meta(crate::store::meta::SELF_USER_ID)
-            .await?
-            && let Ok(mut g) = self.shared.self_user_id.lock()
+        let hash = key_ref.split(':').nth(1).unwrap_or_default();
+        if let Some(i) = self
+            .key_refs
+            .iter()
+            .position(|r| r.split(':').nth(1) == Some(hash))
         {
-            *g = Some(id);
+            return i;
         }
-        Ok(())
+        key_ref
+            .split(':')
+            .next()
+            .and_then(|i| i.parse::<usize>().ok())
+            .filter(|i| *i < self.keys.len())
+            .unwrap_or(0)
     }
 
-    pub fn paperclip_available(&self) -> bool {
-        self.shared
-            .paperclip
-            .lock()
-            .map(|s| !s.down_notified && !s.auth_failed)
-            .unwrap_or(true)
+    pub fn key(&self, index: usize) -> &Arc<P> {
+        &self.keys[index.min(self.keys.len() - 1)]
     }
 
-    /// Agent name from the 10-minute cache (refreshed lazily).
-    pub async fn agent_name(&self, company_id: &str, agent_id: Option<&str>) -> Option<String> {
-        let agent_id = agent_id?;
-        let fresh = |m: &HashMap<String, AgentNames>| {
-            m.get(company_id)
-                .filter(|(at, _)| at.elapsed() < AGENT_CACHE_TTL)
-                .map(|(_, names)| names.get(agent_id).cloned())
-        };
-        if let Some(hit) = self.shared.agents.lock().ok().and_then(|m| fresh(&m)) {
-            return hit;
-        }
-        match self.paperclip.agents(company_id).await {
-            Ok(list) => {
-                let names: HashMap<String, String> =
-                    list.into_iter().map(|a| (a.id, a.name)).collect();
-                let name = names.get(agent_id).cloned();
-                if let Ok(mut m) = self.shared.agents.lock() {
-                    m.insert(company_id.to_string(), (Instant::now(), names));
+    /// A Paperclip call with key `index` succeeded.
+    pub fn paperclip_ok(&self, index: usize) {
+        self.health.paperclip_ok();
+        let all_ok = match self.shared.keys.lock() {
+            Ok(mut keys) => {
+                if let Some(k) = keys.get_mut(index) {
+                    if k.rejected {
+                        tracing::info!(key = index, "paperclip key accepted again");
+                    }
+                    *k = KeyState::default();
                 }
-                name
+                keys.iter().all(|k| !k.rejected)
             }
-            Err(e) => {
-                tracing::debug!(error = %e, "agent list unavailable");
-                self.shared.agents.lock().ok().and_then(|m| {
-                    m.get(company_id)
-                        .and_then(|(_, n)| n.get(agent_id).cloned())
-                })
-            }
+            Err(_) => true,
+        };
+        self.health.set_paperclip_auth_ok(all_ok);
+    }
+
+    /// Key `index` got `401`: unhealthy, one message to General.
+    pub fn key_rejected(&self, index: usize) {
+        self.health.set_paperclip_auth_ok(false);
+        let first = match self.shared.keys.lock() {
+            Ok(mut keys) => match keys.get_mut(index) {
+                Some(k) => {
+                    k.rejected = true;
+                    !std::mem::replace(&mut k.notified, true)
+                }
+                None => false,
+            },
+            Err(_) => false,
+        };
+        if first {
+            tracing::error!(key = index, "paperclip rejected the board key (401)");
+            self.notify(None, crate::render::notices::KEY_REJECTED);
         }
     }
 
-    pub fn remember_issue(&self, issue_id: &str, identifier: Option<&str>, title: Option<&str>) {
-        if let (Some(ident), Ok(mut m)) = (identifier, self.shared.issues.lock()) {
-            m.insert(
-                issue_id.to_string(),
-                (ident.to_string(), title.map(str::to_string)),
-            );
-        }
-    }
-
-    pub fn issue_ref(&self, issue_id: &str) -> Option<String> {
+    pub fn is_key_rejected(&self, index: usize) -> bool {
         self.shared
-            .issues
+            .keys
+            .lock()
+            .ok()
+            .and_then(|k| k.get(index).map(|s| s.rejected))
+            .unwrap_or(false)
+    }
+
+    /// `hot_until` for activity now.
+    pub fn hot_until(&self) -> String {
+        timeutil::format(timeutil::add(timeutil::now(), self.cfg.hot_window))
+    }
+
+    pub fn agent_name(&self, company_id: &str, agent_id: &str) -> Option<String> {
+        self.shared
+            .agents
             .lock()
             .ok()?
-            .get(issue_id)
-            .map(|(r, _)| r.clone())
+            .get(company_id)?
+            .get(agent_id)
+            .cloned()
     }
 }
 
-pub const AGENT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// Time until an RFC 3339 instant (zero when past or unparsable).
+pub fn until(at: &str) -> Duration {
+    timeutil::parse(at)
+        .map(|t| t - timeutil::now())
+        .and_then(|d| Duration::try_from(d).ok())
+        .unwrap_or(Duration::ZERO)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_ref_has_no_key_material() {
+        let r = key_ref(1, "pcp_board_secret_value");
+        assert!(r.starts_with("1:"));
+        assert_eq!(r.len(), 2 + 8);
+        assert!(!r.contains("pcp"));
+        assert_eq!(r, key_ref(1, "pcp_board_secret_value"));
+        assert_ne!(r, key_ref(1, "pcp_other"));
+    }
+}

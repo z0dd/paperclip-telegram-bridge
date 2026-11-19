@@ -1,119 +1,125 @@
-//! Integration harness: real HTTP Paperclip client against wiremock, an
-//! in-memory Telegram fake, a real SQLite store in a temp dir.
+//! Integration harness: real HTTP Paperclip clients against the stateful
+//! mock, an in-memory forum supergroup, a real SQLite store in a temp dir.
+//! Steps are driven explicitly: `cycle` (discovery + outbound), `drain`
+//! (sender), `outbox` (pc_outbox), `update` (inbound).
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bridge::config::{Config, Env};
-use bridge::core::sender::{self, SenderSettings, TgSender};
-use bridge::core::{Bridge, Ctx, dialog, outbox, sync};
+use bridge::core::discovery::{self, DiscoveryState};
+use bridge::core::sender::Sender;
+use bridge::core::{Bridge, Ctx, inbound, outbox};
 use bridge::health::HealthTracker;
 use bridge::paperclip::HttpPaperclipClient;
-use bridge::retry::Backoff;
-use bridge::store::{Delivery, Store};
+use bridge::store::Store;
 use bridge::telegram::*;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::{CHAT, USER};
+use super::paperclip::{KEY, PaperclipMock};
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum TgCall {
-    Send {
-        id: i64,
-        html: String,
-        keyboard: Option<InlineKeyboard>,
-        force_reply: bool,
-    },
-    Edit {
-        id: i64,
-        html: String,
-        keyboard: Option<InlineKeyboard>,
-    },
-    Answer {
-        text: Option<String>,
-    },
-    Commands,
+/// The forum supergroup and the allowed user.
+pub const GROUP: i64 = -1001234567890;
+pub const USER: i64 = 111;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sent {
+    pub id: i64,
+    pub thread: Option<i64>,
+    pub text: String,
+    pub html: bool,
+}
+
+#[derive(Debug)]
+pub struct TgState {
+    pub sent: Vec<Sent>,
+    /// (thread id, name) in creation order.
+    pub topics: Vec<(i64, String)>,
+    pub deleted: HashSet<i64>,
+    pub closed: HashSet<i64>,
+    pub reopened: Vec<i64>,
+    /// Errors returned by the next `sendMessage` calls.
+    pub send_errors: VecDeque<TelegramError>,
+    /// Errors returned by the next `createForumTopic` calls.
+    pub topic_errors: VecDeque<TelegramError>,
+    /// Every HTML message fails with `can't parse entities`.
+    pub reject_html: bool,
+    pub chat: ChatInfo,
+    pub member: MemberInfo,
+    next_thread: i64,
+    next_message: i64,
+}
+
+impl Default for TgState {
+    fn default() -> Self {
+        Self {
+            sent: Vec::new(),
+            topics: Vec::new(),
+            deleted: HashSet::new(),
+            closed: HashSet::new(),
+            reopened: Vec::new(),
+            send_errors: VecDeque::new(),
+            topic_errors: VecDeque::new(),
+            reject_html: false,
+            chat: ChatInfo {
+                kind: "supergroup".into(),
+                is_forum: true,
+            },
+            member: MemberInfo {
+                status: "administrator".into(),
+                can_manage_topics: true,
+            },
+            next_thread: 100,
+            next_message: 1000,
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct FakeTelegram {
-    pub calls: Mutex<Vec<TgCall>>,
-    next_id: AtomicI64,
-    pub fail_sends: AtomicBool,
-    /// `editMessageText` answers `400 message to edit not found`.
-    pub fail_edits: AtomicBool,
+    pub state: Mutex<TgState>,
 }
 
 impl FakeTelegram {
-    pub fn calls(&self) -> Vec<TgCall> {
-        self.calls.lock().unwrap().clone()
+    pub fn st(&self) -> std::sync::MutexGuard<'_, TgState> {
+        self.state.lock().unwrap()
     }
 
-    /// Sent messages: (id, html, keyboard).
-    pub fn sent(&self) -> Vec<(i64, String, Option<InlineKeyboard>)> {
-        self.calls()
+    pub fn sent(&self) -> Vec<Sent> {
+        self.st().sent.clone()
+    }
+
+    /// Texts sent to a topic.
+    pub fn in_topic(&self, thread: i64) -> Vec<String> {
+        self.sent()
             .into_iter()
-            .filter_map(|c| match c {
-                TgCall::Send {
-                    id, html, keyboard, ..
-                } => Some((id, html, keyboard)),
-                _ => None,
-            })
+            .filter(|s| s.thread == Some(thread))
+            .map(|s| s.text)
             .collect()
     }
 
-    pub fn prompts(&self) -> Vec<(i64, String)> {
-        self.calls()
+    pub fn general(&self) -> Vec<String> {
+        self.sent()
             .into_iter()
-            .filter_map(|c| match c {
-                TgCall::Send {
-                    id,
-                    html,
-                    force_reply: true,
-                    ..
-                } => Some((id, html)),
-                _ => None,
-            })
+            .filter(|s| s.thread.is_none())
+            .map(|s| s.text)
             .collect()
     }
 
-    /// Current text and keyboard of a message (after edits).
-    pub fn message(&self, id: i64) -> Option<(String, Option<InlineKeyboard>)> {
-        let mut cur = None;
-        for c in self.calls() {
-            match c {
-                TgCall::Send {
-                    id: i,
-                    html,
-                    keyboard,
-                    ..
-                } if i == id => cur = Some((html, keyboard)),
-                TgCall::Edit {
-                    id: i,
-                    html,
-                    keyboard,
-                } if i == id => cur = Some((html, keyboard)),
-                _ => {}
-            }
-        }
-        cur
+    pub fn topics(&self) -> Vec<(i64, String)> {
+        self.st().topics.clone()
     }
 
-    pub fn answers(&self) -> Vec<Option<String>> {
-        self.calls()
+    /// Thread id of the topic with this name (the newest one).
+    pub fn topic(&self, name: &str) -> Option<i64> {
+        self.topics()
             .into_iter()
-            .filter_map(|c| match c {
-                TgCall::Answer { text } => Some(text),
-                _ => None,
-            })
-            .collect()
-    }
-
-    pub fn texts(&self) -> Vec<String> {
-        self.sent().into_iter().map(|(_, h, _)| h).collect()
+            .rev()
+            .find(|(_, n)| n == name)
+            .map(|(t, _)| t)
     }
 }
 
@@ -126,121 +132,126 @@ impl TelegramApi for FakeTelegram {
     async fn send_message(
         &self,
         _chat: i64,
-        html: &str,
-        markup: Option<&ReplyMarkup>,
+        thread: Option<i64>,
+        text: &str,
+        html: bool,
     ) -> Result<i64> {
-        if self.fail_sends.load(Ordering::SeqCst) {
-            return Err(TelegramError::Transient { reason: "connect" });
+        let mut st = self.st();
+        if let Some(e) = st.send_errors.pop_front() {
+            return Err(e);
         }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1000;
-        let (keyboard, force_reply) = match markup {
-            Some(ReplyMarkup::Inline(k)) => (Some(k.clone()), false),
-            Some(ReplyMarkup::ForceReply) => (None, true),
-            None => (None, false),
-        };
-        self.calls.lock().unwrap().push(TgCall::Send {
+        if let Some(t) = thread {
+            if st.deleted.contains(&t) {
+                return Err(TelegramError::ThreadNotFound);
+            }
+            if st.closed.contains(&t) {
+                return Err(TelegramError::TopicClosed);
+            }
+        }
+        if html && st.reject_html {
+            return Err(TelegramError::CantParseEntities);
+        }
+        st.next_message += 1;
+        let id = st.next_message;
+        st.sent.push(Sent {
             id,
-            html: html.to_string(),
-            keyboard,
-            force_reply,
+            thread,
+            text: text.to_string(),
+            html,
         });
         Ok(id)
     }
 
-    async fn edit_message_text(
-        &self,
-        _chat: i64,
-        id: i64,
-        html: &str,
-        keyboard: Option<&InlineKeyboard>,
-    ) -> Result<()> {
-        if self.fail_edits.load(Ordering::SeqCst) {
-            return Err(TelegramError::MessageNotFound);
+    async fn create_forum_topic(&self, _chat: i64, name: &str) -> Result<i64> {
+        let mut st = self.st();
+        if let Some(e) = st.topic_errors.pop_front() {
+            return Err(e);
         }
-        self.calls.lock().unwrap().push(TgCall::Edit {
-            id,
-            html: html.to_string(),
-            keyboard: keyboard.cloned(),
-        });
+        st.next_thread += 1;
+        let t = st.next_thread;
+        st.topics.push((t, name.to_string()));
+        Ok(t)
+    }
+
+    async fn reopen_forum_topic(&self, _chat: i64, thread: i64) -> Result<()> {
+        let mut st = self.st();
+        if st.deleted.contains(&thread) {
+            return Err(TelegramError::ThreadNotFound);
+        }
+        st.closed.remove(&thread);
+        st.reopened.push(thread);
         Ok(())
     }
 
-    async fn edit_reply_markup(
-        &self,
-        _chat: i64,
-        _id: i64,
-        _keyboard: Option<&InlineKeyboard>,
-    ) -> Result<()> {
-        Ok(())
+    async fn get_me(&self) -> Result<i64> {
+        Ok(42)
     }
 
-    async fn answer_callback_query(&self, _id: &str, text: Option<&str>) -> Result<()> {
-        self.calls.lock().unwrap().push(TgCall::Answer {
-            text: text.map(str::to_string),
-        });
-        Ok(())
+    async fn get_chat(&self, _chat: i64) -> Result<ChatInfo> {
+        Ok(self.st().chat.clone())
     }
 
-    async fn set_my_commands(&self, _chat: i64, _c: &[BotCommand]) -> Result<()> {
-        self.calls.lock().unwrap().push(TgCall::Commands);
-        Ok(())
-    }
-
-    async fn get_me(&self) -> Result<()> {
-        Ok(())
+    async fn get_chat_member(&self, _chat: i64, _user: i64) -> Result<MemberInfo> {
+        Ok(self.st().member.clone())
     }
 }
 
+pub type TestCtx = Ctx<HttpPaperclipClient, FakeTelegram>;
+
 pub struct Harness {
-    pub ctx: Ctx<HttpPaperclipClient, FakeTelegram>,
+    pub ctx: TestCtx,
     pub tg: Arc<FakeTelegram>,
     pub dir: Arc<tempfile::TempDir>,
     pub env: HashMap<String, String>,
-    sender_cancel: CancellationToken,
+    sender: tokio::sync::Mutex<Sender<HttpPaperclipClient, FakeTelegram>>,
+    pub discovery: tokio::sync::Mutex<DiscoveryState>,
     next_update: AtomicI64,
 }
 
-impl Drop for Harness {
-    fn drop(&mut self) {
-        self.sender_cancel.cancel();
-    }
-}
-
 impl Harness {
-    pub async fn start(paperclip_uri: &str, overrides: &[(&str, &str)]) -> Self {
+    pub async fn start(pc: &PaperclipMock, overrides: &[(&str, &str)]) -> Self {
+        Self::start_keys(pc, &[KEY], overrides).await
+    }
+
+    /// One key → `PAPERCLIP_TOKEN_FILE`, several → `PAPERCLIP_TOKEN_FILES`.
+    pub async fn start_keys(pc: &PaperclipMock, keys: &[&str], overrides: &[(&str, &str)]) -> Self {
         let dir = Arc::new(tempfile::tempdir().unwrap());
-        std::fs::write(dir.path().join("pc"), "pcp_board_placeholder\n").unwrap();
+        let key_files: Vec<String> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let p = dir.path().join(format!("pc{i}"));
+                std::fs::write(&p, format!("{k}\n")).unwrap();
+                p.to_string_lossy().into_owned()
+            })
+            .collect();
         std::fs::write(dir.path().join("tg"), "123456:placeholder\n").unwrap();
         let mut env: HashMap<String, String> = [
-            ("PAPERCLIP_URL", paperclip_uri.to_string()),
-            ("PAPERCLIP_COMPANY_IDS", "company-1".into()),
-            ("TELEGRAM_CHAT_ID", CHAT.to_string()),
-            ("TELEGRAM_USER_ID", USER.to_string()),
+            ("PAPERCLIP_URL", pc.uri()),
+            ("TELEGRAM_CHAT_ID", GROUP.to_string()),
+            ("TELEGRAM_ALLOWED_USER_IDS", USER.to_string()),
             ("TELEGRAM_PROXY_URL", "socks5h://127.0.0.1:9".into()),
             ("RETRY_BASE_DELAY", "1ms".into()),
-            ("RETRY_MAX_DELAY", "100ms".into()),
+            ("RETRY_MAX_DELAY", "5ms".into()),
             ("RETRY_NOTIFY_AFTER", "2".into()),
+            ("RETRY_MAX_ATTEMPTS", "3".into()),
             ("PAPERCLIP_REQUEST_TIMEOUT", "3s".into()),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect();
-        env.insert(
-            "PAPERCLIP_TOKEN_FILE".into(),
-            dir.path().join("pc").to_string_lossy().into(),
-        );
-        env.insert(
-            "TELEGRAM_BOT_TOKEN_FILE".into(),
-            dir.path().join("tg").to_string_lossy().into(),
-        );
-        env.insert(
-            "STATE_PATH".into(),
-            dir.path().join("bridge.db").to_string_lossy().into(),
-        );
-        env.insert(
-            "HEALTH_FILE".into(),
-            dir.path().join("health.json").to_string_lossy().into(),
-        );
+        if key_files.len() == 1 {
+            env.insert("PAPERCLIP_TOKEN_FILE".into(), key_files[0].clone());
+        } else {
+            env.insert("PAPERCLIP_TOKEN_FILES".into(), key_files.join(","));
+        }
+        for (k, v) in [
+            ("TELEGRAM_BOT_TOKEN_FILE", "tg"),
+            ("STATE_PATH", "bridge.db"),
+            ("HEALTH_FILE", "health.json"),
+        ] {
+            env.insert(k.into(), dir.path().join(v).to_string_lossy().into());
+        }
         for (k, v) in overrides {
             env.insert(k.to_string(), v.to_string());
         }
@@ -256,42 +267,26 @@ impl Harness {
         let cfg = Config::from_env(&Env::new(&env)).unwrap();
         let store = Store::open(&cfg.state_path).unwrap();
         store.recover().await.unwrap();
-        let paperclip = Arc::new(HttpPaperclipClient::from_config(&cfg.paperclip).unwrap());
-        let (sender_handle, rx) = TgSender::channel();
+        let keys = HttpPaperclipClient::from_config(&cfg.paperclip)
+            .unwrap()
+            .into_iter()
+            .map(Arc::new)
+            .collect();
         let health = Arc::new(HealthTracker::new());
-        let sender_cancel = CancellationToken::new();
-        tokio::spawn(sender::run(
-            tg.clone(),
-            rx,
-            SenderSettings {
-                chat_id: CHAT,
-                min_interval: Duration::ZERO,
-                backoff: Backoff::new(Duration::from_millis(1), Duration::from_millis(5)),
-                max_attempts: 2,
-            },
-            sender_cancel.clone(),
-            health.clone(),
-        ));
-        let ctx = Bridge::new(
-            Arc::new(cfg),
-            paperclip,
-            tg.clone(),
-            store,
-            sender_handle,
-            health,
-        );
-        ctx.load_persisted().await.unwrap();
+        let (ctx, notices) = Bridge::new(Arc::new(cfg), keys, tg.clone(), store, health);
+        let sender = Sender::new(ctx.clone(), notices);
         Self {
             ctx,
             tg,
             dir,
             env,
-            sender_cancel,
+            sender: tokio::sync::Mutex::new(sender),
+            discovery: tokio::sync::Mutex::new(DiscoveryState::default()),
             next_update: AtomicI64::new(first_update),
         }
     }
 
-    /// Simulates a process restart on the same state and chat.
+    /// Simulates a process restart on the same state and the same group.
     pub async fn restart(self) -> Self {
         let dir = self.dir.clone();
         let env = self.env.clone();
@@ -302,102 +297,74 @@ impl Harness {
         Self::build(dir, env, tg, next).await
     }
 
-    pub async fn sync(&self) {
-        sync::cycle(&self.ctx).await.unwrap();
+    /// One discovery + outbound pass (companies are rediscovered every time
+    /// and per-company backoff is cleared).
+    pub async fn cycle(&self) {
+        self.try_cycle().await.unwrap();
     }
 
-    pub async fn try_sync(&self) -> bridge::core::Result<()> {
-        sync::cycle(&self.ctx).await
+    pub async fn try_cycle(&self) -> bridge::core::Result<()> {
+        let mut d = self.discovery.lock().await;
+        d.force_discovery();
+        d.reset_backoff();
+        discovery::cycle(&self.ctx, &mut d).await
+    }
+
+    /// Runs the sender until it has nothing to do now.
+    pub async fn drain(&self) {
+        self.try_drain().await.unwrap();
+    }
+
+    pub async fn try_drain(&self) -> bridge::core::Result<()> {
+        let mut s = self.sender.lock().await;
+        s.resume();
+        s.drain().await
+    }
+
+    /// `cycle` then `drain`.
+    pub async fn sync(&self) {
+        self.cycle().await;
+        self.drain().await;
     }
 
     pub async fn outbox(&self) {
-        outbox::process_due(&self.ctx, &CancellationToken::new())
-            .await
-            .unwrap();
+        self.try_outbox().await.unwrap();
     }
 
     pub async fn try_outbox(&self) -> bridge::core::Result<()> {
         outbox::process_due(&self.ctx, &CancellationToken::new()).await
     }
 
-    pub async fn delivery(&self, interaction_id: &str) -> Delivery {
-        self.ctx
-            .store
-            .delivery_by_interaction(interaction_id.into())
-            .await
-            .unwrap()
-            .expect("delivery exists")
-    }
-
-    fn update_id(&self) -> i64 {
+    pub fn next_update_id(&self) -> i64 {
         self.next_update.fetch_add(1, Ordering::SeqCst)
     }
 
-    pub async fn send_update(&self, update: Value) -> Update {
+    pub async fn update(&self, update: Value) -> Update {
         let u: Update = serde_json::from_value(update).unwrap();
-        dialog::handle_update(&self.ctx, &u).await.unwrap();
+        inbound::handle_update(&self.ctx, &u).await.unwrap();
         u
     }
 
-    pub fn callback_update(&self, data: &str, message_id: i64) -> Value {
-        json!({"update_id": self.update_id(), "callback_query": {
-            "id": format!("cq-{}", self.next_update.load(Ordering::SeqCst)),
-            "from": {"id": USER, "is_bot": false, "first_name": "u"},
-            "message": {"message_id": message_id, "chat": {"id": CHAT, "type": "private"}, "date": 0},
-            "chat_instance": "x", "data": data}})
-    }
-
-    /// Presses a button: `data` is the full callback_data.
-    pub async fn press(&self, data: &str) -> Update {
-        let u = self.callback_update(data, 1);
-        self.send_update(u).await
-    }
-
-    /// Presses the button whose caption starts with `caption` on the card.
-    pub async fn press_button(&self, interaction_id: &str, caption: &str) -> Update {
-        let d = self.delivery(interaction_id).await;
-        let (_, kb) = self
-            .tg
-            .message(d.last_message_id().unwrap())
-            .expect("card message");
-        let kb = kb.expect("keyboard");
-        let data = kb
-            .inline_keyboard
-            .iter()
-            .flatten()
-            .find(|b| b.text.starts_with(caption))
-            .unwrap_or_else(|| panic!("no button {caption}: {kb:?}"))
-            .callback_data
-            .clone();
-        self.press(&data).await
-    }
-
-    pub async fn text(&self, text: &str, reply_to: Option<i64>) -> Update {
-        let u = self.text_update(text, reply_to);
-        self.send_update(u).await
-    }
-
-    /// A text message update (allowed sender and chat), not sent yet.
-    pub fn text_update(&self, text: &str, reply_to: Option<i64>) -> Value {
-        let mut msg = json!({"message_id": 9000 + self.next_update.load(Ordering::SeqCst),
-            "from": {"id": USER, "is_bot": false, "first_name": "u"},
-            "chat": {"id": CHAT, "type": "private"}, "date": 0, "text": text});
-        if let Some(r) = reply_to {
-            msg["reply_to_message"] =
-                json!({"message_id": r, "chat": {"id": CHAT, "type": "private"}, "date": 0});
+    /// A message update; `thread = None` is General.
+    pub fn message(&self, thread: Option<i64>, from: i64, chat: i64, fields: Value) -> Value {
+        let id = self.next_update_id();
+        let mut m = json!({"message_id": 5000 + id, "from": {"id": from, "is_bot": false, "first_name": "u"},
+            "chat": {"id": chat, "type": "supergroup", "is_forum": true}, "date": 0});
+        if let Some(t) = thread {
+            m["message_thread_id"] = json!(t);
+            m["is_topic_message"] = json!(true);
         }
-        json!({"update_id": self.update_id(), "message": msg})
+        if let (Some(obj), Some(extra)) = (m.as_object_mut(), fields.as_object()) {
+            for (k, v) in extra {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        json!({"update_id": id, "message": m})
     }
 
-    /// Current text of the card (last message) and its keyboard.
-    pub async fn card(&self, interaction_id: &str) -> (String, Option<InlineKeyboard>) {
-        let d = self.delivery(interaction_id).await;
-        self.tg.message(d.last_message_id().unwrap()).unwrap()
-    }
-
-    pub fn buttons(kb: &Option<InlineKeyboard>) -> Vec<String> {
-        kb.iter()
-            .flat_map(|k| k.inline_keyboard.iter().flatten().map(|b| b.text.clone()))
-            .collect()
+    /// The allowed user writes `text` in a topic.
+    pub async fn say(&self, thread: i64, text: &str) -> Update {
+        let u = self.message(Some(thread), USER, GROUP, json!({"text": text}));
+        self.update(u).await
     }
 }

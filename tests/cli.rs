@@ -24,11 +24,10 @@ impl Secrets {
 
     fn apply(&self, cmd: &mut Command) {
         cmd.env("PAPERCLIP_URL", "http://paperclip.internal:3100")
-            .env("PAPERCLIP_COMPANY_IDS", "company-a")
             .env("PAPERCLIP_TOKEN_FILE", self.dir.path().join("pc"))
             .env("TELEGRAM_BOT_TOKEN_FILE", self.dir.path().join("tg"))
-            .env("TELEGRAM_CHAT_ID", "123456789")
-            .env("TELEGRAM_USER_ID", "123456789");
+            .env("TELEGRAM_CHAT_ID", "-1001234567890")
+            .env("TELEGRAM_ALLOWED_USER_IDS", "123456789");
     }
 }
 
@@ -70,6 +69,36 @@ fn check_config_ok_does_not_print_secrets() {
 }
 
 #[test]
+fn v1_configuration_is_refused_with_a_migration_hint() {
+    let s = Secrets::new();
+    for (var, hint) in [
+        ("PAPERCLIP_COMPANY_IDS", "discovered automatically"),
+        ("TELEGRAM_USER_ID", "TELEGRAM_ALLOWED_USER_IDS"),
+    ] {
+        let mut cmd = bridge();
+        s.apply(&mut cmd);
+        cmd.env("TELEGRAM_PROXY_URL", "socks5h://xray:1080")
+            .env(var, "123");
+        let out = cmd.arg("check-config").assert().code(2);
+        let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+        assert!(stderr.contains(var) && stderr.contains(hint), "{stderr}");
+    }
+}
+
+#[test]
+fn obsolete_v1_variables_only_warn() {
+    let s = Secrets::new();
+    let mut cmd = bridge();
+    s.apply(&mut cmd);
+    cmd.env("TELEGRAM_PROXY_URL", "socks5h://xray:1080")
+        .env("NOTIFY_RUN_FAILURES", "true");
+    let out = cmd.arg("check-config").assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(stdout.contains("NOTIFY_RUN_FAILURES"), "{stdout}");
+    assert!(stdout.contains("configuration OK"), "{stdout}");
+}
+
+#[test]
 fn unknown_subcommand_is_usage_error() {
     bridge().arg("frobnicate").assert().code(2);
 }
@@ -93,7 +122,12 @@ fn healthcheck_exit_codes() {
         written_at: now.clone(),
         last_telegram_ok_at: Some(now.clone()),
         last_paperclip_ok_at: Some(now),
+        last_discovery_ok_at: None,
         paperclip_auth_ok: true,
+        telegram_group_ok: true,
+        telegram_send_ok: true,
+        agent_chat_ok: true,
+        queue_depth: 0,
     };
     write_file(&file, &state).unwrap();
     bridge()

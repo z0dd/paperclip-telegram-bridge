@@ -1,25 +1,18 @@
-//! Update filter by chat and user (architecture §9). Foreign updates are
+//! Update filter by chat and user (architecture §9, ADR-0010 §2.5). Foreign updates are
 //! dropped silently; logging is rate-limited and carries only a short hash.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::logging::hash_id;
-use crate::telegram::{CallbackQuery, Message, Update};
+use crate::telegram::{Message, Update};
 
 pub const LOG_INTERVAL: Duration = Duration::from_secs(10);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Admitted<'a> {
-    Message(&'a Message),
-    Callback(&'a CallbackQuery),
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rejection {
     ChatMismatch,
     UserMismatch,
-    NotPrivate,
     Unsupported,
 }
 
@@ -28,15 +21,16 @@ impl Rejection {
         match self {
             Self::ChatMismatch => "chat_mismatch",
             Self::UserMismatch => "user_mismatch",
-            Self::NotPrivate => "not_private",
             Self::Unsupported => "unsupported_update",
         }
     }
 }
 
+/// The forum supergroup and the Telegram users allowed to write from it
+/// (ADR-0010 §2.5).
 pub struct Allowlist {
     chat_id: i64,
-    user_id: i64,
+    user_ids: Vec<i64>,
     log: Mutex<LogLimiter>,
 }
 
@@ -46,10 +40,10 @@ struct LogLimiter {
 }
 
 impl Allowlist {
-    pub fn new(chat_id: i64, user_id: i64) -> Self {
+    pub fn new(chat_id: i64, user_ids: Vec<i64>) -> Self {
         Self {
             chat_id,
-            user_id,
+            user_ids,
             log: Mutex::new(LogLimiter {
                 last: None,
                 suppressed: 0,
@@ -57,30 +51,18 @@ impl Allowlist {
         }
     }
 
-    pub fn check<'a>(&self, update: &'a Update) -> Result<Admitted<'a>, Rejection> {
-        if let Some(m) = &update.message {
-            let from = m.from.as_ref().map(|u| u.id);
-            if m.chat.id != self.chat_id {
-                return Err(Rejection::ChatMismatch);
-            }
-            if from != Some(self.user_id) {
-                return Err(Rejection::UserMismatch);
-            }
-            if m.chat.kind != "private" {
-                return Err(Rejection::NotPrivate);
-            }
-            return Ok(Admitted::Message(m));
+    /// Chat first, then sender: a foreign chat is dropped whoever writes.
+    pub fn check<'a>(&self, update: &'a Update) -> Result<&'a Message, Rejection> {
+        let Some(m) = &update.message else {
+            return Err(Rejection::Unsupported);
+        };
+        if m.chat.id != self.chat_id {
+            return Err(Rejection::ChatMismatch);
         }
-        if let Some(cq) = &update.callback_query {
-            if cq.from.id != self.user_id {
-                return Err(Rejection::UserMismatch);
-            }
-            if cq.message.as_ref().map(|m| m.chat.id) != Some(self.chat_id) {
-                return Err(Rejection::ChatMismatch);
-            }
-            return Ok(Admitted::Callback(cq));
+        match m.from.as_ref() {
+            Some(u) if self.user_ids.contains(&u.id) => Ok(m),
+            _ => Err(Rejection::UserMismatch),
         }
-        Err(Rejection::Unsupported)
     }
 
     /// Logs a foreign update at most once per [`LOG_INTERVAL`], with a count
@@ -99,8 +81,6 @@ impl Allowlist {
         }
         let kind = if update.message.is_some() {
             "message"
-        } else if update.callback_query.is_some() {
-            "callback_query"
         } else {
             "other"
         };
@@ -108,7 +88,6 @@ impl Allowlist {
             .message
             .as_ref()
             .and_then(|m| m.from.as_ref())
-            .or(update.callback_query.as_ref().map(|c| &c.from))
             .map(|u| hash_id(u.id));
         if reason != Rejection::Unsupported {
             tracing::warn!(
@@ -131,69 +110,58 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const CHAT: i64 = 111;
+    const CHAT: i64 = -1001234567890;
     const USER: i64 = 111;
+    const OTHER_ALLOWED: i64 = 222;
 
     fn update(v: serde_json::Value) -> Update {
         serde_json::from_value(v).unwrap()
     }
 
-    fn msg(chat: i64, chat_type: &str, from: i64) -> Update {
+    fn msg(chat: i64, from: i64) -> Update {
         update(json!({"update_id": 1, "message": {
             "message_id": 5, "from": {"id": from, "is_bot": false, "first_name": "x"},
-            "chat": {"id": chat, "type": chat_type}, "date": 0, "text": "hi"}}))
+            "chat": {"id": chat, "type": "supergroup", "is_forum": true}, "date": 0,
+            "message_thread_id": 7, "is_topic_message": true, "text": "hi"}}))
     }
 
-    fn cb(chat: i64, from: i64) -> Update {
-        update(json!({"update_id": 2, "callback_query": {
-            "id": "q", "from": {"id": from, "is_bot": false, "first_name": "x"},
-            "message": {"message_id": 7, "chat": {"id": chat, "type": "private"}, "date": 0},
-            "chat_instance": "ci", "data": "v1:ac:1:0"}}))
-    }
-
-    #[test]
-    fn admits_owner() {
-        let a = Allowlist::new(CHAT, USER);
-        assert!(matches!(
-            a.check(&msg(CHAT, "private", USER)),
-            Ok(Admitted::Message(_))
-        ));
-        assert!(matches!(
-            a.check(&cb(CHAT, USER)),
-            Ok(Admitted::Callback(_))
-        ));
+    fn allowlist() -> Allowlist {
+        Allowlist::new(CHAT, vec![USER, OTHER_ALLOWED])
     }
 
     #[test]
-    fn rejects_foreign_chat_user_and_groups() {
-        let a = Allowlist::new(CHAT, USER);
+    fn admits_listed_users_in_the_group() {
+        let a = allowlist();
+        assert!(a.check(&msg(CHAT, USER)).is_ok());
+        assert!(a.check(&msg(CHAT, OTHER_ALLOWED)).is_ok());
+    }
+
+    #[test]
+    fn rejects_foreign_chat_and_user() {
+        let a = allowlist();
         assert_eq!(
-            a.check(&msg(999, "private", USER)),
-            Err(Rejection::ChatMismatch)
+            a.check(&msg(-100999, USER)).unwrap_err(),
+            Rejection::ChatMismatch
         );
         assert_eq!(
-            a.check(&msg(CHAT, "private", 999)),
-            Err(Rejection::UserMismatch)
+            a.check(&msg(USER, USER)).unwrap_err(),
+            Rejection::ChatMismatch
         );
         assert_eq!(
-            a.check(&msg(CHAT, "group", USER)),
-            Err(Rejection::NotPrivate)
+            a.check(&msg(CHAT, 999)).unwrap_err(),
+            Rejection::UserMismatch
         );
-        assert_eq!(a.check(&cb(CHAT, 999)), Err(Rejection::UserMismatch));
-        assert_eq!(a.check(&cb(999, USER)), Err(Rejection::ChatMismatch));
-        // Group with the owner as sender but another chat id.
-        assert_eq!(
-            a.check(&msg(-100123, "supergroup", USER)),
-            Err(Rejection::ChatMismatch)
-        );
+        let anonymous = update(json!({"update_id": 2, "message": {
+            "message_id": 6, "chat": {"id": CHAT, "type": "supergroup"}, "text": "x"}}));
+        assert_eq!(a.check(&anonymous).unwrap_err(), Rejection::UserMismatch);
         let unknown = update(json!({"update_id": 3, "edited_message": {}}));
-        assert_eq!(a.check(&unknown), Err(Rejection::Unsupported));
+        assert_eq!(a.check(&unknown).unwrap_err(), Rejection::Unsupported);
     }
 
     #[test]
     fn rejection_log_is_rate_limited() {
-        let a = Allowlist::new(CHAT, USER);
-        let u = msg(999, "private", 999);
+        let a = allowlist();
+        let u = msg(999, 999);
         let t0 = Instant::now();
         assert!(a.log_rejection_at(&u, Rejection::ChatMismatch, t0));
         assert!(!a.log_rejection_at(&u, Rejection::ChatMismatch, t0 + Duration::from_secs(1)));
@@ -202,20 +170,22 @@ mod tests {
     }
 
     #[test]
-    fn updates_are_parsed() {
-        let m = msg(CHAT, "private", USER);
-        let mm = m.message.unwrap();
-        assert_eq!(mm.text.as_deref(), Some("hi"));
-        assert!(mm.reply_to_message.is_none());
-        let r = update(json!({"update_id": 4, "message": {
-            "message_id": 6, "from": {"id": USER}, "chat": {"id": CHAT, "type": "private"},
-            "text": "answer", "reply_to_message": {"message_id": 5, "chat": {"id": CHAT, "type": "private"}}}}));
-        assert_eq!(r.message.unwrap().reply_to_message.unwrap().message_id, 5);
-        let photo = update(json!({"update_id": 5, "message": {
-            "message_id": 7, "from": {"id": USER}, "chat": {"id": CHAT, "type": "private"},
+    fn topic_messages_are_parsed() {
+        let m = msg(CHAT, USER).message.unwrap();
+        assert_eq!(m.topic_thread_id(), Some(7));
+        assert!(!m.is_topic_service());
+        let general = update(json!({"update_id": 4, "message": {
+            "message_id": 6, "from": {"id": USER}, "chat": {"id": CHAT, "type": "supergroup"},
+            "text": "hi"}}));
+        assert_eq!(general.message.unwrap().topic_thread_id(), None);
+        let service = update(json!({"update_id": 5, "message": {
+            "message_id": 7, "from": {"id": USER}, "chat": {"id": CHAT, "type": "supergroup"},
+            "message_thread_id": 7, "is_topic_message": true,
+            "forum_topic_closed": {}}}));
+        assert!(service.message.unwrap().is_topic_service());
+        let photo = update(json!({"update_id": 6, "message": {
+            "message_id": 8, "from": {"id": USER}, "chat": {"id": CHAT, "type": "supergroup"},
             "photo": [{"file_id": "x"}]}}));
         assert!(photo.message.unwrap().text.is_none());
-        let c = cb(CHAT, USER).callback_query.unwrap();
-        assert_eq!(c.data.as_deref(), Some("v1:ac:1:0"));
     }
 }

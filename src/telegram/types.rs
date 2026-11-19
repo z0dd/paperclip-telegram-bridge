@@ -1,14 +1,13 @@
-//! Bot API types the bridge reads and writes (subset).
+//! Bot API types the bridge reads (subset).
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Update {
     pub update_id: i64,
     #[serde(default)]
     pub message: Option<Message>,
-    #[serde(default)]
-    pub callback_query: Option<CallbackQuery>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -23,71 +22,63 @@ pub struct Chat {
     pub kind: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Message {
     pub message_id: i64,
     #[serde(default)]
     pub from: Option<User>,
     pub chat: Chat,
     #[serde(default)]
+    pub message_thread_id: Option<i64>,
+    #[serde(default)]
+    pub is_topic_message: Option<bool>,
+    #[serde(default)]
     pub text: Option<String>,
     #[serde(default)]
-    pub reply_to_message: Option<Box<ReplyRef>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct ReplyRef {
-    pub message_id: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct CallbackQuery {
-    pub id: String,
-    pub from: User,
+    pub forum_topic_created: Option<Value>,
     #[serde(default)]
-    pub message: Option<CallbackMessage>,
+    pub forum_topic_edited: Option<Value>,
     #[serde(default)]
-    pub data: Option<String>,
+    pub forum_topic_closed: Option<Value>,
+    #[serde(default)]
+    pub forum_topic_reopened: Option<Value>,
+    #[serde(default)]
+    pub general_forum_topic_hidden: Option<Value>,
+    #[serde(default)]
+    pub general_forum_topic_unhidden: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct CallbackMessage {
-    pub message_id: i64,
-    pub chat: Chat,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Button {
-    pub text: String,
-    pub callback_data: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
-pub struct InlineKeyboard {
-    pub inline_keyboard: Vec<Vec<Button>>,
-}
-
-impl InlineKeyboard {
-    pub fn is_empty(&self) -> bool {
-        self.inline_keyboard.iter().all(Vec::is_empty)
+impl Message {
+    /// Service message about topics (created, renamed, closed, …).
+    pub fn is_topic_service(&self) -> bool {
+        self.forum_topic_created.is_some()
+            || self.forum_topic_edited.is_some()
+            || self.forum_topic_closed.is_some()
+            || self.forum_topic_reopened.is_some()
+            || self.general_forum_topic_hidden.is_some()
+            || self.general_forum_topic_unhidden.is_some()
     }
 
-    pub fn row(&mut self, buttons: Vec<Button>) {
-        if !buttons.is_empty() {
-            self.inline_keyboard.push(buttons);
+    /// The topic the message was written in; `None` for General.
+    pub fn topic_thread_id(&self) -> Option<i64> {
+        if self.is_topic_message == Some(true) {
+            self.message_thread_id
+        } else {
+            None
         }
     }
 }
 
+/// `getChat` (subset).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReplyMarkup {
-    Inline(InlineKeyboard),
-    /// `force_reply` prompt for free-text input.
-    ForceReply,
+pub struct ChatInfo {
+    pub kind: String,
+    pub is_forum: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BotCommand {
-    pub command: String,
-    pub description: String,
+/// `getChatMember` (subset).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberInfo {
+    pub status: String,
+    pub can_manage_topics: bool,
 }
