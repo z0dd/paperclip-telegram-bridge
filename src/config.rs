@@ -197,7 +197,7 @@ impl<'a> Env<'a> {
 
     fn duration(&self, var: &'static str, default: &str) -> Result<Duration, ConfigError> {
         let raw = self.get(var).unwrap_or(default);
-        let d = humantime::parse_duration(raw).map_err(|_| ConfigError::Invalid {
+        let d = parse_duration(raw).ok_or_else(|| ConfigError::Invalid {
             var,
             reason: "expected a duration like 15s or 2m".into(),
         })?;
@@ -316,6 +316,41 @@ impl<'a> Env<'a> {
             (None, None) => Err(ConfigError::Missing(ONE)),
         }
     }
+}
+
+/// `500ms`, `15s`, `2m`, `1h`, `1d` and sums like `1h 30m`. The units of
+/// humantime that the configuration documents; replaces the unmaintained crate.
+pub fn parse_duration(raw: &str) -> Option<Duration> {
+    let mut total = Duration::ZERO;
+    let mut rest = raw.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digits == 0 {
+            return None;
+        }
+        let n: u64 = rest[..digits].parse().ok()?;
+        rest = rest[digits..].trim_start();
+        let unit_len = rest
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(rest.len());
+        let unit = &rest[..unit_len];
+        let one = match unit {
+            "ms" | "msec" => Duration::from_millis(1),
+            "s" | "sec" | "secs" => Duration::from_secs(1),
+            "m" | "min" | "mins" => Duration::from_secs(60),
+            "h" | "hr" | "hrs" | "hour" | "hours" => Duration::from_secs(3600),
+            "d" | "day" | "days" => Duration::from_secs(86_400),
+            _ => return None,
+        };
+        total = total.checked_add(one.checked_mul(u32::try_from(n).ok()?)?)?;
+        rest = rest[unit_len..].trim_start();
+    }
+    Some(total)
 }
 
 pub fn read_secret_file(var: &'static str, path: &Path) -> Result<SecretString, ConfigError> {
@@ -756,6 +791,29 @@ mod tests {
             f.vars.insert(var.into(), value.into());
             let err = parse(&f.vars).expect_err(var);
             assert!(err.to_string().contains(var), "{var}: {err}");
+        }
+    }
+
+    #[test]
+    fn durations() {
+        for (raw, ms) in [
+            ("500ms", 500),
+            ("15s", 15_000),
+            ("2m", 120_000),
+            ("1h", 3_600_000),
+            ("1d", 86_400_000),
+            ("1h 30m", 5_400_000),
+            ("1m30s", 90_000),
+            (" 10min ", 600_000),
+        ] {
+            assert_eq!(
+                parse_duration(raw),
+                Some(Duration::from_millis(ms)),
+                "{raw}"
+            );
+        }
+        for bad in ["", "15", "s", "1.5s", "-1s", "15x", "soon", "1 s s"] {
+            assert_eq!(parse_duration(bad), None, "{bad}");
         }
     }
 
