@@ -1,5 +1,5 @@
-//! Persistent state in SQLite (architecture §3–4). One connection lives in a
-//! dedicated thread (actor); async code sends it closures over a channel.
+//! Persistent state in SQLite (ADR-0003, ADR-0010 §2.4). One connection lives
+//! in a dedicated thread (actor); async code sends it closures over a channel.
 //! Every public method is one transaction. `core` sees only these methods
 //! and the model types, never rusqlite.
 
@@ -8,10 +8,7 @@ mod sqlite;
 use std::path::Path;
 use std::sync::mpsc;
 
-use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
-
-use crate::domain::{Draft, Interaction, Resolution};
 
 pub use sqlite::SCHEMA_VERSION;
 
@@ -25,8 +22,6 @@ pub enum StoreError {
     TooNew(i64),
     #[error("state store is closed")]
     Closed,
-    #[error("state data could not be decoded")]
-    Decode,
 }
 
 impl From<rusqlite::Error> for StoreError {
@@ -38,176 +33,182 @@ impl From<rusqlite::Error> for StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeliveryStatus {
-    New,
-    Sending,
-    Sent,
-    Answering,
-    Answered,
-    /// Governed card accepted; following `toolAction.status`.
-    Following,
-    Closed,
-    Unsupported,
-}
-
-impl DeliveryStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::New => "new",
-            Self::Sending => "sending",
-            Self::Sent => "sent",
-            Self::Answering => "answering",
-            Self::Answered => "answered",
-            Self::Following => "following",
-            Self::Closed => "closed",
-            Self::Unsupported => "unsupported",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "new" => Self::New,
-            "sending" => Self::Sending,
-            "sent" => Self::Sent,
-            "answering" => Self::Answering,
-            "answered" => Self::Answered,
-            "following" => Self::Following,
-            "closed" => Self::Closed,
-            "unsupported" => Self::Unsupported,
-            _ => return None,
-        })
-    }
-
-    /// The card may still be resolved in Paperclip and is shown as open.
-    pub fn is_open(self) -> bool {
-        matches!(self, Self::Sent | Self::Answering | Self::Unsupported)
-    }
-}
-
-/// What was shown to the user: the normalised card plus header data.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Snapshot {
-    pub interaction: Interaction,
-    pub issue_title: Option<String>,
-    pub agent_name: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Delivery {
-    pub id: i64,
-    pub interaction_id: String,
+/// A company seen by one of the keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanyRow {
     pub company_id: String,
-    pub issue_id: String,
-    pub issue_ref: String,
-    pub kind: String,
-    pub snapshot: Snapshot,
-    pub status: DeliveryStatus,
-    pub generation: i64,
-    pub closed_reason: Option<String>,
-    pub follow_until: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-    /// `(chunk, message_id)` ordered by chunk.
-    pub messages: Vec<(i64, i64)>,
-}
-
-impl Delivery {
-    /// The message that carries the keyboard and gets edited.
-    pub fn last_message_id(&self) -> Option<i64> {
-        self.messages.last().map(|(_, m)| *m)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct NewDelivery {
-    pub interaction_id: String,
-    pub company_id: String,
-    pub issue_id: String,
-    pub issue_ref: String,
-    pub snapshot: Snapshot,
-    pub status: DeliveryStatus,
+    pub name: String,
+    pub issue_prefix: String,
+    pub key_ref: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutboxStatus {
+pub enum TopicState {
+    /// Not created yet.
+    Pending,
+    Active,
+    Closed,
+    /// Deleted in Telegram: to be created again.
+    Recreating,
+}
+
+impl TopicState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::Closed => "closed",
+            Self::Recreating => "recreating",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "active" => Self::Active,
+            "closed" => Self::Closed,
+            "recreating" => Self::Recreating,
+            _ => Self::Pending,
+        }
+    }
+}
+
+/// A conversation and its topic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conversation {
+    pub issue_id: String,
+    pub company_id: String,
+    pub identifier: Option<String>,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub key_ref: String,
+    pub discovered_at: String,
+    pub watermark_comment_id: Option<String>,
+    pub cursor_comment_id: Option<String>,
+    /// `updatedAt` of the conversation at the last poll.
+    pub last_updated_at: Option<String>,
+    pub hot_until: Option<String>,
+    pub last_swept_at: Option<String>,
+    pub topic_thread_id: Option<i64>,
+    pub topic_name: String,
+    pub topic_state: TopicState,
+    pub removed_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewConversation {
+    pub issue_id: String,
+    pub company_id: String,
+    pub identifier: Option<String>,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub key_ref: String,
+    /// Newest comment at discovery: nothing up to it is forwarded.
+    pub watermark_comment_id: Option<String>,
+    pub updated_at: Option<String>,
+    pub topic_name: String,
+}
+
+/// One piece of an agent comment for Telegram.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewChunk {
+    pub comment_id: String,
+    pub chunk: u32,
+    pub chunks: u32,
+    pub html: String,
+    pub plain: String,
+}
+
+/// Comments read in one pass over a conversation, committed together with
+/// the cursor (ADR-0010 §2.6).
+#[derive(Debug, Clone, Default)]
+pub struct CommentBatch {
+    pub issue_id: String,
+    /// Every new comment id, forwarded or not.
+    pub seen: Vec<String>,
+    pub chunks: Vec<NewChunk>,
+    /// New cursor; `None` keeps the current one.
+    pub cursor: Option<String>,
+    pub swept_at: String,
+    /// Extends the hot window when set.
+    pub hot_until: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TgChunk {
+    pub id: i64,
+    pub issue_id: String,
+    pub comment_id: String,
+    pub chunk: u32,
+    pub chunks: u32,
+    pub html: Option<String>,
+    pub plain: Option<String>,
+    /// Send without `parse_mode` (after `can't parse entities`).
+    pub use_plain: bool,
+    pub attempts: u32,
+    /// Topic of the conversation at the time of reading.
+    pub thread_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcStatus {
     Pending,
     InFlight,
     Done,
-    Abandoned,
+    Rejected,
 }
 
-impl OutboxStatus {
+impl PcStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::InFlight => "in_flight",
             Self::Done => "done",
-            Self::Abandoned => "abandoned",
+            Self::Rejected => "rejected",
         }
     }
 
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
+    pub fn parse(s: &str) -> Self {
+        match s {
             "pending" => Self::Pending,
             "in_flight" => Self::InFlight,
             "done" => Self::Done,
-            "abandoned" => Self::Abandoned,
-            _ => return None,
-        })
+            _ => Self::Rejected,
+        }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct OutboxEntry {
+/// A user message from Telegram on its way to Paperclip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PcEntry {
     pub id: i64,
-    pub delivery_id: i64,
-    /// `None` after the entry is done (body is wiped).
-    pub resolution: Option<Resolution>,
-    pub status: OutboxStatus,
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub update_id: i64,
+    pub issue_id: String,
+    pub client_request_id: String,
+    /// `None` once finished (wiped).
+    pub body: Option<String>,
+    pub status: PcStatus,
     pub attempts: u32,
-    pub next_attempt_at: String,
     pub last_error: Option<String>,
-    pub created_at: String,
+    pub comment_id: Option<String>,
+    /// "In the queue" was already told to the user.
+    pub notified: bool,
 }
 
-/// State changes of one Telegram update, committed together with the offset.
 #[derive(Debug, Clone)]
-pub enum StoreOp {
-    PutDraft(Draft),
-    DeleteDraft(i64),
-    /// Drops text-waiting of every other draft (one waiting at a time).
-    ClearOtherTextAwaiting {
-        keep: i64,
-    },
-    /// Queues the answer and moves the delivery to `answering`. Ignored if an
-    /// entry already exists (at most one answer per card).
-    Enqueue {
-        delivery_id: i64,
-        resolution: Resolution,
-    },
-    SetStatus {
-        delivery_id: i64,
-        status: DeliveryStatus,
-        closed_reason: Option<String>,
-    },
-    BumpGeneration(i64),
+pub struct NewPcEntry {
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub issue_id: String,
+    pub client_request_id: String,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Recovery {
-    /// Outbox entries moved from `in_flight` back to `pending`.
-    pub outbox_reset: usize,
-    /// Deliveries left in `sending`: to be delivered again.
-    pub sending: Vec<i64>,
-}
-
-/// A one-question text card whose v1.0.0 draft was dropped (ADR-0009 §2).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResetDraft {
-    pub delivery_id: i64,
-    pub issue_ref: String,
+    /// `pc_outbox` entries moved from `in_flight` back to `pending`.
+    pub pc_reset: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,10 +227,7 @@ pub struct Store {
 
 pub mod meta {
     pub const TELEGRAM_OFFSET: &str = "telegram_offset";
-    pub const RUNS_BASELINE_AT: &str = "runs_baseline_at";
-    pub const DONE_BASELINE_AT: &str = "done_baseline_at";
     pub const STARTED_AT: &str = "started_at";
-    pub const SELF_USER_ID: &str = "self_user_id";
 }
 
 impl Store {
@@ -277,13 +275,6 @@ impl Store {
         self.call(sqlite::recover).await
     }
 
-    /// Drops drafts of one-question text cards (whatever the delivery status)
-    /// and bumps their generation, in one transaction. Nothing is queued and
-    /// the draft text is not read. Returns the `sent` cards to re-render.
-    pub async fn reset_chat_text_drafts(&self) -> Result<Vec<ResetDraft>> {
-        self.call(sqlite::reset_chat_text_drafts).await
-    }
-
     pub async fn get_meta(&self, key: &'static str) -> Result<Option<String>> {
         self.call(move |c| sqlite::get_meta(c, key)).await
     }
@@ -300,242 +291,183 @@ impl Store {
             .unwrap_or(0))
     }
 
-    /// Skips an update without effects (foreign, unsupported, stale).
+    /// Skips an update without effects (foreign, unsupported, hint only).
     pub async fn advance_offset(&self, update_id: i64) -> Result<CommitOutcome> {
-        self.commit_update(update_id, Vec::new()).await
-    }
-
-    /// Applies `ops` and sets `telegram_offset = update_id + 1` atomically.
-    pub async fn commit_update(&self, update_id: i64, ops: Vec<StoreOp>) -> Result<CommitOutcome> {
-        self.call(move |c| sqlite::commit_update(c, Some(update_id), ops))
+        self.call(move |c| sqlite::commit_update(c, update_id, None))
             .await
     }
 
-    /// Applies `ops` in one transaction without touching the offset.
-    pub async fn apply(&self, ops: Vec<StoreOp>) -> Result<()> {
-        self.call(move |c| sqlite::commit_update(c, None, ops).map(|_| ()))
+    /// Queues a user message and sets `telegram_offset = update_id + 1`
+    /// atomically (ADR-0010 §2.5). A message already queued is not queued again.
+    pub async fn enqueue_message(&self, update_id: i64, e: NewPcEntry) -> Result<CommitOutcome> {
+        self.call(move |c| sqlite::commit_update(c, update_id, Some(e)))
             .await
     }
 
-    /// Inserts a delivery unless the interaction is already known.
-    pub async fn insert_delivery(&self, d: NewDelivery) -> Result<Option<i64>> {
-        self.call(move |c| sqlite::insert_delivery(c, &d)).await
+    pub async fn upsert_companies(&self, rows: Vec<CompanyRow>) -> Result<()> {
+        self.call(move |c| sqlite::upsert_companies(c, &rows)).await
     }
 
-    pub async fn delivery(&self, id: i64) -> Result<Option<Delivery>> {
-        self.call(move |c| sqlite::delivery(c, id)).await
+    pub async fn conversations(&self) -> Result<Vec<Conversation>> {
+        self.call(sqlite::conversations).await
     }
 
-    pub async fn delivery_by_interaction(
+    pub async fn conversation(&self, issue_id: String) -> Result<Option<Conversation>> {
+        self.call(move |c| sqlite::conversation(c, &issue_id)).await
+    }
+
+    pub async fn conversation_by_thread(&self, thread_id: i64) -> Result<Option<Conversation>> {
+        self.call(move |c| sqlite::conversation_by_thread(c, thread_id))
+            .await
+    }
+
+    /// Inserts a new conversation (topic `pending`) with its watermark marked
+    /// as seen. Returns `false` if it was already known.
+    pub async fn insert_conversation(&self, n: NewConversation) -> Result<bool> {
+        self.call(move |c| sqlite::insert_conversation(c, &n)).await
+    }
+
+    /// Marks a conversation as gone from `/chats` (`Some`) or back (`None`).
+    pub async fn set_removed(&self, issue_id: String, at: Option<String>) -> Result<()> {
+        self.call(move |c| sqlite::set_removed(c, &issue_id, at.as_deref()))
+            .await
+    }
+
+    /// New `updatedAt` seen; opens the hot window.
+    pub async fn set_updated_at(
         &self,
-        interaction_id: String,
-    ) -> Result<Option<Delivery>> {
-        self.call(move |c| sqlite::delivery_by_interaction(c, &interaction_id))
-            .await
-    }
-
-    pub async fn delivery_by_message(&self, message_id: i64) -> Result<Option<Delivery>> {
-        self.call(move |c| sqlite::delivery_by_message(c, message_id))
-            .await
-    }
-
-    pub async fn deliveries_with_status(
-        &self,
-        statuses: Vec<DeliveryStatus>,
-    ) -> Result<Vec<Delivery>> {
-        self.call(move |c| sqlite::deliveries_with_status(c, &statuses))
-            .await
-    }
-
-    pub async fn known_interactions(&self, ids: Vec<String>) -> Result<Vec<String>> {
-        self.call(move |c| sqlite::known_interactions(c, &ids))
-            .await
-    }
-
-    pub async fn set_status(
-        &self,
-        delivery_id: i64,
-        status: DeliveryStatus,
-        closed_reason: Option<String>,
-    ) -> Result<()> {
-        self.apply(vec![StoreOp::SetStatus {
-            delivery_id,
-            status,
-            closed_reason,
-        }])
-        .await
-    }
-
-    /// `sending` → `sent` with message ids (one transaction).
-    pub async fn mark_sent(
-        &self,
-        delivery_id: i64,
-        status: DeliveryStatus,
-        messages: Vec<i64>,
-    ) -> Result<()> {
-        self.call(move |c| sqlite::mark_sent(c, delivery_id, status, &messages))
-            .await
-    }
-
-    /// Replaces the id of the last chunk (message re-sent after "not found").
-    pub async fn replace_last_message(&self, delivery_id: i64, message_id: i64) -> Result<()> {
-        self.call(move |c| sqlite::replace_last_message(c, delivery_id, message_id))
-            .await
-    }
-
-    /// Card resolved: closes the delivery, deletes its draft.
-    pub async fn close_delivery(
-        &self,
-        delivery_id: i64,
-        status: DeliveryStatus,
-        reason: String,
-    ) -> Result<()> {
-        self.call(move |c| sqlite::close_delivery(c, delivery_id, status, &reason))
-            .await
-    }
-
-    pub async fn update_snapshot(&self, delivery_id: i64, snapshot: Snapshot) -> Result<()> {
-        self.call(move |c| sqlite::update_snapshot(c, delivery_id, &snapshot))
-            .await
-    }
-
-    pub async fn set_following(&self, delivery_id: i64, until: String) -> Result<()> {
-        self.call(move |c| sqlite::set_following(c, delivery_id, &until))
-            .await
-    }
-
-    pub async fn draft(&self, delivery_id: i64) -> Result<Option<Draft>> {
-        self.call(move |c| sqlite::draft(c, delivery_id)).await
-    }
-
-    pub async fn drafts(&self) -> Result<Vec<Draft>> {
-        self.call(sqlite::drafts).await
-    }
-
-    /// The draft currently waiting for free text, if any.
-    pub async fn text_awaiting_draft(&self) -> Result<Option<Draft>> {
-        self.call(sqlite::text_awaiting_draft).await
-    }
-
-    pub async fn draft_by_prompt_message(&self, message_id: i64) -> Result<Option<Draft>> {
-        self.call(move |c| sqlite::draft_by_prompt_message(c, message_id))
-            .await
-    }
-
-    pub async fn set_prompt_message(&self, delivery_id: i64, message_id: i64) -> Result<()> {
-        self.call(move |c| sqlite::set_prompt_message(c, delivery_id, message_id))
-            .await
-    }
-
-    pub async fn outbox_for(&self, delivery_id: i64) -> Result<Option<OutboxEntry>> {
-        self.call(move |c| sqlite::outbox_for(c, delivery_id)).await
-    }
-
-    /// Due `pending` entries, oldest first.
-    pub async fn due_outbox(&self, now: String) -> Result<Vec<OutboxEntry>> {
-        self.call(move |c| sqlite::due_outbox(c, &now)).await
-    }
-
-    pub async fn next_outbox_due(&self) -> Result<Option<String>> {
-        self.call(sqlite::next_outbox_due).await
-    }
-
-    pub async fn pending_outbox_count(&self) -> Result<u64> {
-        self.call(sqlite::pending_outbox_count).await
-    }
-
-    pub async fn outbox_in_flight(&self, id: i64) -> Result<()> {
-        self.call(move |c| sqlite::outbox_set_status(c, id, OutboxStatus::InFlight))
-            .await
-    }
-
-    /// Outbox done (body wiped) and delivery status in one transaction.
-    pub async fn outbox_done(
-        &self,
-        id: i64,
-        delivery_id: i64,
-        status: DeliveryStatus,
-        reason: Option<String>,
+        issue_id: String,
+        updated_at: Option<String>,
+        hot_until: String,
     ) -> Result<()> {
         self.call(move |c| {
-            sqlite::outbox_finish(
-                c,
-                id,
-                delivery_id,
-                OutboxStatus::Done,
-                status,
-                reason.as_deref(),
-            )
+            sqlite::set_updated_at(c, &issue_id, updated_at.as_deref(), &hot_until)
         })
         .await
     }
 
-    /// Outbox abandoned and delivery status in one transaction.
-    pub async fn outbox_abandon(
-        &self,
-        id: i64,
-        delivery_id: i64,
-        status: DeliveryStatus,
-        reason: Option<String>,
-    ) -> Result<()> {
-        self.call(move |c| {
-            sqlite::outbox_finish(
-                c,
-                id,
-                delivery_id,
-                OutboxStatus::Abandoned,
-                status,
-                reason.as_deref(),
-            )
-        })
-        .await
-    }
-
-    /// Removes a finished entry so the card can be answered again (partial
-    /// verdicts, validation errors).
-    pub async fn outbox_remove(
-        &self,
-        id: i64,
-        delivery_id: i64,
-        status: DeliveryStatus,
-    ) -> Result<()> {
-        self.call(move |c| sqlite::outbox_remove(c, id, delivery_id, status))
+    /// Extends the hot window (never shortens it).
+    pub async fn extend_hot(&self, issue_id: String, hot_until: String) -> Result<()> {
+        self.call(move |c| sqlite::extend_hot(c, &issue_id, &hot_until))
             .await
     }
 
-    pub async fn outbox_retry(
+    /// Of `ids`, those already in `seen_comments` of the conversation.
+    pub async fn seen_of(&self, issue_id: String, ids: Vec<String>) -> Result<Vec<String>> {
+        self.call(move |c| sqlite::seen_of(c, &issue_id, &ids)).await
+    }
+
+    /// Seen ids, Telegram pieces and the cursor in one transaction.
+    pub async fn commit_comments(&self, b: CommentBatch) -> Result<()> {
+        self.call(move |c| sqlite::commit_comments(c, &b)).await
+    }
+
+    /// Drops `seen_comments` older than `before` beyond the newest `keep` of
+    /// each conversation; the cursor anchor is always kept.
+    pub async fn purge_seen(&self, before: String, keep: u32) -> Result<usize> {
+        self.call(move |c| sqlite::purge_seen(c, &before, keep))
+            .await
+    }
+
+    /// Oldest conversation whose topic is to be created.
+    pub async fn next_topic_job(&self) -> Result<Option<Conversation>> {
+        self.call(sqlite::next_topic_job).await
+    }
+
+    /// Topic created: `active` with the new thread id.
+    pub async fn set_topic(&self, issue_id: String, thread_id: i64) -> Result<()> {
+        self.call(move |c| sqlite::set_topic(c, &issue_id, thread_id))
+            .await
+    }
+
+    /// The topic `thread_id` was deleted: recreate it (no-op if the
+    /// conversation already moved to another topic).
+    pub async fn topic_lost(&self, issue_id: String, thread_id: i64) -> Result<()> {
+        self.call(move |c| sqlite::topic_lost(c, &issue_id, thread_id))
+            .await
+    }
+
+    /// Next piece to send: oldest due, its topic active, nothing older pending
+    /// in the same conversation.
+    pub async fn next_chunk(&self, now: String) -> Result<Option<TgChunk>> {
+        self.call(move |c| sqlite::next_chunk(c, &now)).await
+    }
+
+    /// Earliest `next_attempt_at` of pending pieces.
+    pub async fn next_chunk_due(&self) -> Result<Option<String>> {
+        self.call(sqlite::next_chunk_due).await
+    }
+
+    pub async fn chunk_sent(&self, id: i64, message_id: i64) -> Result<()> {
+        self.call(move |c| sqlite::chunk_sent(c, id, message_id))
+            .await
+    }
+
+    pub async fn chunk_use_plain(&self, id: i64) -> Result<()> {
+        self.call(move |c| sqlite::chunk_use_plain(c, id)).await
+    }
+
+    pub async fn chunk_retry(&self, id: i64, attempts: u32, next_at: String) -> Result<()> {
+        self.call(move |c| sqlite::chunk_retry(c, id, attempts, &next_at))
+            .await
+    }
+
+    pub async fn chunk_abandon(&self, id: i64) -> Result<()> {
+        self.call(move |c| sqlite::chunk_abandon(c, id)).await
+    }
+
+    /// Pieces waiting for Telegram.
+    pub async fn queue_depth(&self) -> Result<u64> {
+        self.call(sqlite::queue_depth).await
+    }
+
+    /// Due `pending` user messages, oldest first.
+    pub async fn due_messages(&self, now: String) -> Result<Vec<PcEntry>> {
+        self.call(move |c| sqlite::due_messages(c, &now)).await
+    }
+
+    pub async fn next_message_due(&self) -> Result<Option<String>> {
+        self.call(sqlite::next_message_due).await
+    }
+
+    pub async fn message_in_flight(&self, id: i64) -> Result<()> {
+        self.call(move |c| sqlite::message_in_flight(c, id)).await
+    }
+
+    /// `done`: body wiped, comment id kept.
+    pub async fn message_done(&self, id: i64, comment_id: Option<String>) -> Result<()> {
+        self.call(move |c| sqlite::message_finish(c, id, PcStatus::Done, comment_id.as_deref(), None))
+            .await
+    }
+
+    /// `rejected`: body wiped, error class kept.
+    pub async fn message_rejected(&self, id: i64, error: String) -> Result<()> {
+        self.call(move |c| sqlite::message_finish(c, id, PcStatus::Rejected, None, Some(&error)))
+            .await
+    }
+
+    pub async fn message_retry(
         &self,
         id: i64,
         attempts: u32,
         next_at: String,
         last_error: String,
+        notified: bool,
     ) -> Result<()> {
-        self.call(move |c| sqlite::outbox_retry(c, id, attempts, &next_at, &last_error))
+        self.call(move |c| sqlite::message_retry(c, id, attempts, &next_at, &last_error, notified))
             .await
     }
 
-    pub async fn is_run_seen(&self, run_id: String) -> Result<bool> {
-        self.call(move |c| sqlite::is_seen(c, "seen_runs", "run_id", &run_id))
-            .await
+    pub async fn message(&self, id: i64) -> Result<Option<PcEntry>> {
+        self.call(move |c| sqlite::message(c, id)).await
     }
 
-    pub async fn mark_runs_seen(&self, ids: Vec<String>) -> Result<()> {
-        self.call(move |c| sqlite::mark_seen(c, "seen_runs", "run_id", &ids))
-            .await
+    pub async fn messages(&self) -> Result<Vec<PcEntry>> {
+        self.call(sqlite::messages).await
     }
 
-    pub async fn is_done_issue_seen(&self, issue_id: String) -> Result<bool> {
-        self.call(move |c| sqlite::is_seen(c, "seen_done_issues", "issue_id", &issue_id))
-            .await
-    }
-
-    pub async fn mark_done_issues_seen(&self, ids: Vec<String>) -> Result<()> {
-        self.call(move |c| sqlite::mark_seen(c, "seen_done_issues", "issue_id", &ids))
-            .await
-    }
-
-    /// Drops `seen_runs` rows older than `before`.
-    pub async fn purge_seen(&self, before: String) -> Result<usize> {
-        self.call(move |c| sqlite::purge_seen(c, &before)).await
+    /// All pieces, for tests and diagnostics.
+    pub async fn chunks(&self) -> Result<Vec<(TgChunk, String)>> {
+        self.call(sqlite::chunks).await
     }
 }
