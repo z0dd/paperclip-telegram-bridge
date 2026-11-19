@@ -83,6 +83,8 @@ pub struct State {
     /// Successful user comments get a receipt and an agent reply.
     pub auto_reply: bool,
     pub posts: Vec<Post>,
+    /// Heartbeat runs by id (`GET /api/heartbeat-runs/{id}`); unknown → 404.
+    pub runs: HashMap<String, Value>,
     /// Delay of every POST answer (a request in flight during shutdown).
     pub post_delay: Option<std::time::Duration>,
     pub health: Value,
@@ -109,6 +111,7 @@ impl Default for State {
             post_errors: HashMap::new(),
             auto_reply: false,
             posts: Vec::new(),
+            runs: HashMap::new(),
             post_delay: None,
             health: json!({"status": "ok", "version": "2026.1106.0"}),
             seq: 0,
@@ -245,6 +248,10 @@ impl Respond for Handle {
                     .collect();
                 json_response(200, Value::Array(list))
             }
+            ("GET", ["api", "heartbeat-runs", run]) => match st.runs.get(*run) {
+                Some(r) => json_response(200, r.clone()),
+                None => json_response(404, json!({"error": "Heartbeat run not found"})),
+            },
             ("GET", ["api", "issues", issue, "comments"]) => {
                 let all = st.comments.get(*issue).cloned().unwrap_or_default();
                 let asc = query(req, "order").as_deref() == Some("asc");
@@ -516,6 +523,28 @@ impl PaperclipMock {
                    "presentation": {"kind": "system_notice"}}),
             true,
         )
+    }
+
+    /// A run with its final status and error.
+    pub fn run(&self, run_id: &str, status: &str, error: Option<&str>) -> &Self {
+        self.st().runs.insert(
+            run_id.to_string(),
+            json!({"id": run_id, "status": status, "error": error}),
+        );
+        self
+    }
+
+    /// A service notice: Paperclip posts the first line of the run error on
+    /// behalf of the conversation agent (same author, origin and metadata as a
+    /// reply, docs/paperclip-api.md).
+    pub fn service_notice(&self, issue_id: &str, run_id: &str, error: &str) -> String {
+        self.run(run_id, "failed", Some(error));
+        let first = error.lines().next().unwrap_or_default().to_string();
+        let mut st = self.st();
+        let agent = st.agent_of(issue_id).unwrap_or_else(|| "agent-x".into());
+        let mut c = agent_json(&agent, &first);
+        c["createdByRunId"] = json!(run_id);
+        st.push_comment(issue_id, c, true)
     }
 
     /// Any comment JSON (fields are completed with id, issueId, createdAt).

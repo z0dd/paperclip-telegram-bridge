@@ -208,6 +208,11 @@ impl PaperclipApi for HttpPaperclipClient {
         .await
     }
 
+    async fn run(&self, run_id: &str) -> Result<RunOutcome> {
+        let v = self.get(&["heartbeat-runs", run_id], &[]).await?;
+        dto::run(&v).ok_or(PaperclipError::Decode)
+    }
+
     async fn post_comment(
         &self,
         issue_id: &str,

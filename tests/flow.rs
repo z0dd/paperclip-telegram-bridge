@@ -66,7 +66,7 @@ async fn history_before_discovery_is_not_forwarded() {
 }
 
 #[tokio::test]
-async fn only_agent_replies_and_receipts_go_to_telegram() {
+async fn agent_replies_receipts_and_system_notices_go_to_telegram() {
     let pc = pet().await;
     pc.agent("company-pet", "agent-other", "Other");
     let (h, thread) = started(&pc).await;
@@ -86,7 +86,38 @@ async fn only_agent_replies_and_receipts_go_to_telegram() {
     pc.receipt("issue-1", "Принято");
     pc.agent_says("issue-1", "Ответ");
     h.sync().await;
-    assert_eq!(h.tg.in_topic(thread), ["Принято", "Ответ"]);
+    assert_eq!(h.tg.in_topic(thread), ["⚠️ Run failed", "Принято", "Ответ"]);
+}
+
+#[tokio::test]
+async fn service_notices_are_marked_and_replies_are_not() {
+    let pc = pet().await;
+    let (h, thread) = started(&pc).await;
+    pc.service_notice(
+        "issue-1",
+        "run-failed",
+        "ACP agent reported a terminal limit failure.\nYou've hit your session limit",
+    );
+    // A reply written by a run that failed later stays an ordinary reply.
+    pc.run(
+        "run-progress",
+        "failed",
+        Some("ACP agent reported a terminal limit failure."),
+    );
+    let mut progress = support::paperclip::agent_json("agent-lead", "Прогресс");
+    progress["createdByRunId"] = json!("run-progress");
+    pc.comment("issue-1", progress, true);
+    // Unknown run (404): forwarded without the mark.
+    pc.agent_says("issue-1", "Ответ");
+    h.sync().await;
+    assert_eq!(
+        h.tg.in_topic(thread),
+        [
+            "⚠️ ACP agent reported a terminal limit failure.",
+            "Прогресс",
+            "Ответ"
+        ]
+    );
 }
 
 #[tokio::test]

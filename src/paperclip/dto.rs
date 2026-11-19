@@ -103,8 +103,17 @@ pub fn comment(c: &Value) -> Option<Comment> {
         author_type: AuthorType::parse(c.get("authorType").and_then(Value::as_str).unwrap_or("")),
         author_agent_id: s(c, "authorAgentId"),
         origin: s(c, "origin"),
+        created_by_run_id: s(c, "createdByRunId"),
         created_at: s(c, "createdAt").unwrap_or_default(),
         deleted: c.get("deletedAt").is_some_and(|d| !d.is_null()),
+    })
+}
+
+/// `GET /api/heartbeat-runs/{id}`: a run without `status` is not a run.
+pub fn run(v: &Value) -> Option<RunOutcome> {
+    Some(RunOutcome {
+        status: s(v, "status")?,
+        error: s(v, "error"),
     })
 }
 
@@ -122,7 +131,8 @@ mod tests {
     fn comment_kinds_are_parsed() {
         let v = json!([
             {"id": "c1", "body": "**hi**", "authorType": "agent", "authorAgentId": "a1",
-             "origin": "comment", "createdAt": "2026-11-19T10:00:00.000Z", "deletedAt": null},
+             "origin": "comment", "createdByRunId": "r1",
+             "createdAt": "2026-11-19T10:00:00.000Z", "deletedAt": null},
             {"id": "c2", "body": "Принято", "authorType": "agent", "authorAgentId": "a1",
              "origin": "fast_response", "fastResponseRequestId": "f1"},
             {"id": "c3", "body": "hello", "authorType": "user", "authorUserId": "u1",
@@ -139,9 +149,19 @@ mod tests {
         assert_eq!(c[0].author_agent_id.as_deref(), Some("a1"));
         assert!(!c[0].deleted);
         assert!(c[1].is_fast_response());
+        assert_eq!(c[0].created_by_run_id.as_deref(), Some("r1"));
+        assert_eq!(c[1].created_by_run_id, None);
         assert_eq!(c[2].author_type, AuthorType::User);
         assert_eq!(c[3].author_type, AuthorType::System);
         assert!(c[4].deleted);
+    }
+
+    #[test]
+    fn runs_are_parsed() {
+        let r = run(&json!({"id": "r1", "status": "failed", "error": "boom\nmore"})).unwrap();
+        assert_eq!(r.status, "failed");
+        assert_eq!(r.error.as_deref(), Some("boom\nmore"));
+        assert!(run(&json!({"error": "API route not found"})).is_none());
     }
 
     #[test]

@@ -7,7 +7,7 @@ pub mod version;
 use std::future::Future;
 use std::time::Duration;
 
-use crate::domain::{Agent, Chat, Comment, Company, HealthInfo};
+use crate::domain::{Agent, Chat, Comment, Company, HealthInfo, RunOutcome};
 
 pub use http::HttpPaperclipClient;
 
@@ -125,6 +125,10 @@ pub trait PaperclipApi: Send + Sync + 'static {
         issue_id: &str,
         limit: u32,
     ) -> impl Future<Output = Result<Vec<Comment>>> + Send;
+
+    /// `GET /api/heartbeat-runs/{id}`: status and error of the run that wrote
+    /// a comment (service notices, docs/paperclip-api.md).
+    fn run(&self, run_id: &str) -> impl Future<Output = Result<RunOutcome>> + Send;
 
     /// `POST /api/issues/{id}/comments` with `clientRequestId`. Returns the
     /// comment id. No `X-Paperclip-Run-Id`: this is the user writing.

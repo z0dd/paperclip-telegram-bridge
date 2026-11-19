@@ -23,10 +23,11 @@
 | Водяной знак | `GET /api/issues/{issueId}/comments?order=desc&limit=1` | при обнаружении беседы |
 | Новые комментарии | `GET /api/issues/{issueId}/comments?order=asc&after=<id>&limit=100` | беседа изменилась, «горячая» или пора страховочного обхода |
 | Восстановление курсора | `GET /api/issues/{issueId}/comments?order=desc&limit=100` | пустой ответ по курсору при сдвинутом `updatedAt` |
+| Запуск автора комментария | `GET /api/heartbeat-runs/{runId}` | только для пересылаемого однострочного комментария с `createdByRunId` (до 300 символов): распознавание служебных сообщений, §6.1 |
 | Сообщение пользователя | `POST /api/issues/{issueId}/comments` | из `pc_outbox` |
 | Отзыв ключа | `POST /api/cli-auth/revoke-current` | команда `bridge revoke-paperclip-key` |
 
-Bridge **не** вызывает: создание и изменение задач, карточки (`interactions`), approvals, runs, `PATCH` задач, управление ключами.
+Bridge **не** вызывает: создание и изменение задач, карточки (`interactions`), approvals, список и управление runs (кроме чтения одного run, §6.1), `PATCH` задач, управление ключами.
 
 ## 3. Health — `GET /api/health` `[живой API]`
 
@@ -78,12 +79,32 @@ Bridge **не** вызывает: создание и изменение зад�
 - **`after` возвращает сам якорь повторно** `[живой API]`: bridge отбрасывает уже виденные `id` (`seen_comments`). Неизвестный `after` → `[]` без ошибки `[код]`.
 - `updatedAt` беседы растёт с каждым комментарием, кроме квитанций (`origin: "fast_response"`) `[код]`. Поэтому после активности беседа 10 минут «горячая» (`CONVERSATION_HOT_WINDOW`) и читается каждый цикл; холодные беседы читаются раз в `PAPERCLIP_SWEEP_INTERVAL`.
 
-**Что пересылается в Telegram** (`domain::should_forward`, ADR-0010 §1.6): `deletedAt == null && authorType == "agent" && authorAgentId == conversationAgentId`. Это ответы агента беседы и квитанции Paperclip. Не пересылаются: сообщения пользователя (в том числе отправленные самим bridge — защита от эха), системные (`authorType: "system"`, открытый вопрос 6.3 ADR), комментарии других агентов, удалённые.
+**Что пересылается в Telegram** (`domain::should_forward`, ADR-0010 §1.6, §6.3): `deletedAt == null && (authorType == "agent" && authorAgentId == conversationAgentId || authorType == "system")`. Это ответы агента беседы, квитанции Paperclip и системные уведомления (последние — с пометкой ⚠️, §6.1). Не пересылаются: сообщения пользователя (в том числе отправленные самим bridge — защита от эха), комментарии других агентов, удалённые.
 
 ```json
 {"id":"c-1","body":"**Готово**","authorType":"agent","authorAgentId":"agent-1",
  "origin":"comment","createdAt":"2026-11-19T10:00:00.000Z","deletedAt":null}
 ```
+
+### 6.1. Служебные сообщения: пометка ⚠️ `[живой API]`
+
+Решение пользователя (PET-4, ответ на вопрос 6.3 ADR): служебные сообщения Paperclip в беседе уходят в тему с префиксом `⚠️ `. Служебными считаются:
+
+1. комментарии `authorType: "system"` `[код]`: пометка без дополнительных запросов;
+2. сообщения о сбое или отмене запуска (`ACP agent reported a terminal limit failure.`, `cancelled` и т. п.), которые Paperclip публикует от имени агента беседы `[живой API]`: правило ниже.
+ Обычные ответы агента идут без пометки, комментарии пользователя по-прежнему не пересылаются.
+
+Поля комментария сообщение второго вида не выделяют. Проверено на живом инстансе 2026-11-19: у сообщения `ACP agent reported a terminal limit failure.` тот же `authorType: "agent"` и `authorAgentId` агента беседы, `origin: "comment"`, `presentation: null`, а `metadata.authorizationReason: "internal_agent_write"` бывает и у обычных ответов. Отличает его запуск, указанный в `createdByRunId`:
+
+```json
+GET /api/heartbeat-runs/{runId}
+{"id":"…","status":"failed","errorCode":"provider_quota",
+ "error":"ACP agent reported a terminal limit failure.\nYou've hit your session limit · …"}
+```
+
+Правило (`domain::is_service_notice`, без учёта регистра): `status` запуска — `failed`, `cancelled` или `timed_out`, а текст комментария совпадает с первой строкой `error` либо с самим `status` (сообщение `cancelled` при `error: "Cancelled before issue reassignment"`). Обычный ответ, написанный запуском, который потом упал, правилу не соответствует: его текст не совпадает с ошибкой.
+
+Запуск запрашивается только для комментария, который и так пересылается (`should_forward`), с `createdByRunId`, не квитанции, в одну строку длиной до 300 символов. Если запрос не удался (`403`, `404`, сеть), комментарий уходит как обычный ответ, без пометки; в лог пишется DEBUG.
 
 ## 7. Сообщение пользователя — `POST /api/issues/{issueId}/comments` `[код]`
 

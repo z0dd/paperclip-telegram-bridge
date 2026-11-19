@@ -4,7 +4,10 @@
 //! in one transaction.
 
 use super::{CoreError, Ctx, Result};
-use crate::domain::{Comment, should_forward};
+use crate::domain::{
+    Comment, SERVICE_NOTICE_PREFIX, is_service_notice, is_system_notice, may_be_service_notice,
+    should_forward,
+};
 use crate::fault;
 use crate::paperclip::PaperclipApi;
 use crate::render;
@@ -42,7 +45,7 @@ pub async fn read<P: PaperclipApi, T: TelegramApi>(
         }
         let last = page.last().map(|c| c.id.clone());
         let fresh = unseen(ctx, conv, page).await?;
-        commit(ctx, conv, fresh, last.clone()).await?;
+        commit(ctx, key, conv, fresh, last.clone()).await?;
         if !full {
             break;
         }
@@ -74,7 +77,7 @@ async fn fallback<P: PaperclipApi, T: TelegramApi>(
 ) -> Result<()> {
     let latest = ctx.key(key).comments_latest(&conv.issue_id, PAGE).await?;
     let Some(newest) = latest.first().map(|c| c.id.clone()) else {
-        return commit(ctx, conv, Vec::new(), None).await;
+        return commit(ctx, key, conv, Vec::new(), None).await;
     };
     let ids = latest.iter().map(|c| c.id.clone()).collect();
     let seen = ctx.store.seen_of(conv.issue_id.clone(), ids).await?;
@@ -93,11 +96,12 @@ async fn fallback<P: PaperclipApi, T: TelegramApi>(
             "comment cursor anchor is gone, recovered from the newest page"
         );
     }
-    commit(ctx, conv, fresh, Some(newest)).await
+    commit(ctx, key, conv, fresh, Some(newest)).await
 }
 
 async fn commit<P: PaperclipApi, T: TelegramApi>(
     ctx: &Ctx<P, T>,
+    key: usize,
     conv: &Conversation,
     fresh: Vec<Comment>,
     cursor: Option<String>,
@@ -114,7 +118,12 @@ async fn commit<P: PaperclipApi, T: TelegramApi>(
         if !forwards(c, conv) {
             continue;
         }
-        let pieces = render::comment_chunks(&c.body, conv.identifier.as_deref(), &ctx.render);
+        let body = if is_notice(ctx, key, c).await {
+            format!("{SERVICE_NOTICE_PREFIX}{}", c.body)
+        } else {
+            c.body.clone()
+        };
+        let pieces = render::comment_chunks(&body, conv.identifier.as_deref(), &ctx.render);
         let total = pieces.len() as u32;
         for (i, p) in pieces.into_iter().enumerate() {
             batch.chunks.push(NewChunk {
@@ -147,7 +156,37 @@ async fn commit<P: PaperclipApi, T: TelegramApi>(
     Ok(())
 }
 
-/// The forwarding rule (ADR-0010 §1.6, open question 6.3 → `should_forward`).
+/// The forwarding rule (ADR-0010 §1.6 and §6.3 → `should_forward`).
 fn forwards(c: &Comment, conv: &Conversation) -> bool {
     should_forward(c, &conv.agent_id)
+}
+
+/// Service notices go to the topic marked with ⚠️ (user decision in PET-4):
+/// system comments and agent-authored comments repeating the error of a failed
+/// run. A failed run lookup forwards the comment as an ordinary reply.
+async fn is_notice<P: PaperclipApi, T: TelegramApi>(
+    ctx: &Ctx<P, T>,
+    key: usize,
+    c: &Comment,
+) -> bool {
+    if is_system_notice(c) {
+        return true;
+    }
+    if !may_be_service_notice(c) {
+        return false;
+    }
+    let Some(run_id) = c.created_by_run_id.as_deref() else {
+        return false;
+    };
+    match ctx.key(key).run(run_id).await {
+        Ok(run) => is_service_notice(c, &run),
+        Err(e) => {
+            tracing::debug!(
+                comment_id = %c.id,
+                error = %e.class(),
+                "run lookup failed, forwarding as an ordinary reply"
+            );
+            false
+        }
+    }
 }
