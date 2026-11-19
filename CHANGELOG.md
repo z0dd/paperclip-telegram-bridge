@@ -2,7 +2,7 @@
 
 Формат: [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии по [SemVer](https://semver.org/lang/ru/).
 
-## [2.0.0] - не выпущена
+## [2.0.0] - 2026-11-19
 
 Бридж зеркалирует беседы Agent Chat Paperclip в темы одной приватной супергруппы Telegram. Архитектура — [ADR-0010](docs/adr/0010-v2-forum-bridge.md).
 
