@@ -85,6 +85,8 @@ pub struct State {
     pub posts: Vec<Post>,
     /// Heartbeat runs by id (`GET /api/heartbeat-runs/{id}`); unknown → 404.
     pub runs: HashMap<String, Value>,
+    /// Forced answer of `GET /api/heartbeat-runs/{id}` per run (every call).
+    pub run_errors: HashMap<String, Forced>,
     /// Delay of every POST answer (a request in flight during shutdown).
     pub post_delay: Option<std::time::Duration>,
     pub health: Value,
@@ -112,6 +114,7 @@ impl Default for State {
             auto_reply: false,
             posts: Vec::new(),
             runs: HashMap::new(),
+            run_errors: HashMap::new(),
             post_delay: None,
             health: json!({"status": "ok", "version": "2026.1106.0"}),
             seq: 0,
@@ -248,10 +251,15 @@ impl Respond for Handle {
                     .collect();
                 json_response(200, Value::Array(list))
             }
-            ("GET", ["api", "heartbeat-runs", run]) => match st.runs.get(*run) {
-                Some(r) => json_response(200, r.clone()),
-                None => json_response(404, json!({"error": "Heartbeat run not found"})),
-            },
+            ("GET", ["api", "heartbeat-runs", run]) => {
+                if let Some(f) = st.run_errors.get(*run) {
+                    return forced(f);
+                }
+                match st.runs.get(*run) {
+                    Some(r) => json_response(200, r.clone()),
+                    None => json_response(404, json!({"error": "Heartbeat run not found"})),
+                }
+            }
             ("GET", ["api", "issues", issue, "comments"]) => {
                 let all = st.comments.get(*issue).cloned().unwrap_or_default();
                 let asc = query(req, "order").as_deref() == Some("asc");
@@ -532,6 +540,23 @@ impl PaperclipMock {
             json!({"id": run_id, "status": status, "error": error}),
         );
         self
+    }
+
+    /// `GET /api/heartbeat-runs/{id}` fails with this answer.
+    pub fn fail_run(&self, run_id: &str, f: Forced) -> &Self {
+        self.st().run_errors.insert(run_id.to_string(), f);
+        self
+    }
+
+    /// Requests for `GET /api/heartbeat-runs/*` received so far.
+    pub async fn run_lookups(&self) -> usize {
+        self.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().starts_with("/api/heartbeat-runs/"))
+            .count()
     }
 
     /// A service notice: Paperclip posts the first line of the run error on
