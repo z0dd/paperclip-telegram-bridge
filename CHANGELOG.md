@@ -2,7 +2,45 @@
 
 Формат: [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии по [SemVer](https://semver.org/lang/ru/).
 
-## [1.1.0] - не выпущена
+## [2.0.0] - не выпущена
+
+Бридж зеркалирует беседы Agent Chat Paperclip в темы одной приватной супергруппы Telegram. Архитектура — [ADR-0010](docs/adr/0010-v2-forum-bridge.md).
+
+### Added
+
+- Одна супергруппа с темами: тема на каждую беседу, название «`<issuePrefix>` · `<имя агента>`». Тема создаётся сразу при обнаружении беседы, без рестарта.
+- Автообнаружение компаний (`GET /api/companies?scope=accessible`) и бесед (`GET /api/companies/{id}/chats`) во всех компаниях ключа; несколько ключей одного пользователя через `PAPERCLIP_TOKEN_FILES`.
+- В тему уходят ответы агента беседы и квитанции Paperclip; история до обнаружения беседы не пересылается (водяной знак). Markdown → HTML, нарезка по 4096 символов, при ошибке разметки — простой текст.
+- Текст из темы становится комментарием беседы с детерминированным `clientRequestId` (UUIDv5): повтор после сбоя не создаёт второй комментарий и не будит агента дважды.
+- Удалённая тема создаётся заново, закрытая открывается (тексты ошибок Telegram не проверены вживую, см. `docs/paperclip-api.md` §8).
+- Единая очередь вызовов Telegram с интервалом `TELEGRAM_GROUP_MIN_INTERVAL` (3 с, лимит 20 сообщений в минуту на группу).
+- Проверки супергруппы при старте: форум, бот — администратор с правом «Управление темами». При нарушении — ERROR и unhealthy без цикла рестартов, повтор раз в 5 минут.
+- Healthcheck: `queue_depth`, `last_discovery_ok_at`, признаки «Agent Chat выключен», «группа не прошла проверку», «Telegram отвечает 403». WARN при очереди больше 60.
+- Новые переменные: `TELEGRAM_ALLOWED_USER_IDS`, `PAPERCLIP_TOKEN_FILES`, `PAPERCLIP_DISCOVERY_INTERVAL`, `PAPERCLIP_SWEEP_INTERVAL`, `CONVERSATION_HOT_WINDOW`, `TELEGRAM_GROUP_MIN_INTERVAL`.
+
+### Changed
+
+- **Breaking:** `TELEGRAM_CHAT_ID` — id супергруппы (`-100…`), а не личного чата.
+- `PAPERCLIP_POLL_INTERVAL` по умолчанию 5 с: опрос бесед и «горячих» комментариев.
+- Длительности в конфиге разбирает собственный парсер (`500ms`, `15s`, `2m`, `1h`, `1d`, `1h 30m`) вместо `humantime` (RUSTSEC-2026-0542).
+- Версия пакета `1.1.0` → `2.0.0`.
+
+### Removed
+
+- **Breaking:** карточки v1 (вопросы, подтверждения, вердикты, governed-подтверждения), команды `/status`, `/backlog`, `/cancel`, `/help`, `setMyCommands`, обработка кнопок, уведомления о сбоях run и завершённых задачах.
+- **Breaking:** `PAPERCLIP_COMPANY_IDS` и `TELEGRAM_USER_ID`: если заданы, старт отклоняется с подсказкой по миграции.
+- `PAPERCLIP_RUNS_POLL_INTERVAL`, `PAPERCLIP_GOVERNED_TIMEOUT`, `GOVERNED_*`, `NOTIFY_*`: если заданы, только WARN при старте.
+
+### Fixed
+
+- Нарезка длинного текста больше не разрезает слово, если сразу за границей куска стоит пробел.
+
+### Migration
+
+- Миграция состояния 2 удаляет таблицы карточек v1, `meta.telegram_offset` сохраняется. Volume `/state` остаётся прежним.
+- Шаги перехода — в README, раздел «Переход с v1».
+
+## [1.1.0] - 2026-11-17
 
 ### Added
 

@@ -14,7 +14,7 @@ docker compose logs --tail=200 bridge   # логи в stderr, JSON по умол
 docker compose exec bridge /usr/local/bin/bridge healthcheck   # "healthy" или "unhealthy: <причина>"
 ```
 
-В самом чате: `/status` показывает число карточек, ожидающих ответа, задачи в работе, активных агентов, сбои за 24 часа и **длину очереди ответов** (`очередь ответов: N`).
+Команд в чате v2 нет. Длина очереди в Telegram — поле `queue_depth` в `HEALTH_FILE`; при очереди больше 60 в логе WARN `telegram queue is long`.
 
 ## 2. Диагностика
 
@@ -24,24 +24,28 @@ docker compose exec bridge /usr/local/bin/bridge healthcheck   # "healthy" ил�
 | лог `bridge failed` с `error: cannot open state: state database failed the integrity check` | повреждён `bridge.db` | остановить bridge и восстановить из backup ([BACKUP_RESTORE.md](BACKUP_RESTORE.md)); автопочинки нет |
 | лог `bridge failed` с `error: cannot open state: … schema version N is newer than supported` | том использовался более новой версией bridge | запустить образ той же или более новой версии; откат версии не поддерживается |
 | `healthcheck`: `health file unreadable` или `health file is stale (Ns old)` | процесс не запущен или завис (файл обновляется раз в 15 с, предел 60 с) | смотреть логи, перезапустить |
-| `unhealthy: Paperclip key rejected (401/403)` | ключ отозван, истёк или неверный | раздел 3 (ротация), в чате будет сообщение «🔑 Ключ Paperclip отклонён» |
+| `unhealthy: Paperclip key rejected (401)` | ключ отозван, истёк или неверный | раздел 3 (ротация); в General приходит «🔑 Paperclip отклонил ключ бриджа (401)». Повтор раз в 5 минут |
+| `unhealthy: Agent Chat is disabled in Paperclip` | в Paperclip выключен experimental-флаг Agent Chat (`404 Agent Chat is disabled`) | включить Agent Chat; в General приходит одно сообщение, после включения bridge продолжит сам |
+| `unhealthy: Telegram supergroup check failed …`, в логе ERROR `telegram supergroup check failed` с `reason` | `TELEGRAM_CHAT_ID` не супергруппа, темы выключены, бот не администратор или без права «Управление темами» | исправить настройку группы по `reason`; проверка повторяется раз в 5 минут, рестарт не нужен |
+| `unhealthy: Telegram refuses messages to the supergroup (403)` | бота удалили из группы или лишили прав | вернуть бота администратором; отправка повторяется раз в 5 минут |
 | `unhealthy: no successful telegram call for Ns` | proxy/Telegram недоступны дольше `HEALTH_MAX_STALE` (5 мин) | проверить proxy и сеть контейнера; bridge продолжает ретраи |
-| `unhealthy: no successful paperclip call for Ns` | Paperclip недоступен дольше `HEALTH_MAX_STALE` | проверить Paperclip и сеть. В чате после 3 подряд неудач приходит «⚠️ Paperclip недоступен с ЧЧ:ММ», после восстановления — «✅ Связь с Paperclip восстановлена» |
+| `unhealthy: no successful paperclip call for Ns` | Paperclip недоступен дольше `HEALTH_MAX_STALE` | проверить Paperclip и сеть; сообщения из Telegram ждут в очереди |
 | В логах `getUpdates conflict: another bridge instance is running or a webhook is set for this bot` | второй экземпляр на этом боте или у бота установлен webhook (Telegram отвечает 409 на `getUpdates`) | остановить второй экземпляр; webhook bridge сам **не снимает**, удалите его средствами Bot API (`deleteWebhook`). Bridge повторяет попытки с паузой до 5 минут |
 | В логах `telegram rejected the bot token` | токен бота неверен или отозван в BotFather | записать новый токен в файл секрета и перезапустить. Повтор раз в 5 минут |
-| В логах WARN `paperclip version differs from the tested one`, `paperclip version is missing` или `paperclip version is not recognized` | версия Paperclip отличается от проверенной (`tested_version` в записи), не отдана или не формата `YYYY.MMDD.N` | **запуск не блокируется**, bridge работает. Версия контракта могла измениться: проверьте ответы на карточки и [PAPERCLIP_PERMISSIONS](PAPERCLIP_PERMISSIONS.md); проверенная версия — константа в `src/paperclip/version.rs` |
+| В логах WARN `paperclip version differs from the tested one`, `paperclip version is missing` или `paperclip version is not recognized` | версия Paperclip отличается от проверенной, не отдана или не формата `YYYY.MMDD.N` | **запуск не блокируется**. API бесед мог измениться: проверьте обмен сообщениями в одной теме; проверенная версия — константа в `src/paperclip/version.rs` |
 | Бот не стартует, `configuration error` про файл секрета, при этом файл существует | контейнер (UID 65532) не может прочитать файл: у файла владелец хост-пользователь и права `0400`/`0600`/`0640` (rootless Docker) | пересоздать файл по рецепту из раздела 3.5 или поставить `0644` в каталоге `0700` |
-| В чате «🔄 Bridge обновлён: черновик ответа на … сброшен, текст не отправлен» после обновления | миграция v1.1.0: незавершённый draft однотекстовой карточки сброшен | ожидаемо; ответьте на вопрос обычным сообщением |
-| Текст в чат отправлен, но бот пишет «Открыто несколько вопросов» или «Сейчас нет вопросов…» | сообщение без reply, а открыто несколько однотекстовых карточек или ни одной | ответить reply на нужную карточку; в Paperclip ничего не ушло |
+| `configuration error: PAPERCLIP_COMPANY_IDS is no longer supported in v2` или то же про `TELEGRAM_USER_ID` | конфигурация v1 | README, раздел «Переход с v1» |
+| В логах WARN `variable of v1 is no longer used, remove it` | заданы `GOVERNED_*`, `NOTIFY_*` и т. п. | убрать переменную, на работу не влияет |
 | В логах `paperclip health check failed, continuing` при старте | `GET /api/health` не ответил при запуске | проверить `PAPERCLIP_URL` и сеть; bridge продолжает работу и ретраит |
-| В логах `ignored update from outside the allowlist` (`reason`: `chat_mismatch`, `user_mismatch`, `not_private`) | кто-то пишет боту или неверно заданы `TELEGRAM_CHAT_ID`/`TELEGRAM_USER_ID` | если это вы: сверить ID. Чужим бот не отвечает. Запись не чаще раза в 10 секунд |
-| Ответ нажат, но в Paperclip его нет; в чате «⏳ ответ … в очереди» | Paperclip недоступен или отвечает 5xx/429/409 без кода; ответ хранится в outbox и отправляется бессрочно | дождаться восстановления; длина очереди видна в `/status` |
-| «❌ Paperclip не принял ответ…» | Paperclip ответил 400/422 | исправить ответ и отправить снова (текст ошибки сервера в сообщении) или ответить в Paperclip |
-| «— Решено в Paperclip … ваш ответ не отправлен» | карточку успели решить в UI или агентом | ничего, ответ не нужен |
-| «— Paperclip не разрешает этому ключу ответить на эту карточку, ответьте в UI» | 403 с audience-кодом (`interaction_human_only`, `interaction_addressee_mismatch` и др.): ключ принадлежит не тому пользователю или карточка не для него | ответить в UI; проверить, что ключ выпущен владельцем вопросов |
-| Карточка пришла дважды | падение процесса между отправкой в Telegram и записью в SQLite (документированный компромисс) | ответить на любую, второй ответ невозможен |
-| В логах `tasks did not stop within the grace period` или `outbox did not finish within the grace period` | остановка заняла весь `SHUTDOWN_GRACE` | запись outbox вернётся в очередь при старте; проверьте, что `stop_grace_period` > 2 × `SHUTDOWN_GRACE` (README) |
-| Много карточек пришло сразу после первого старта | при первом запуске доставляется вся текущая лента `attention` | ожидаемо; при более 10 новых сначала приходит сводка |
+| В логах `ignored update from outside the allowlist` (`reason`: `chat_mismatch`, `user_mismatch`) | пишут из другого чата или пользователь не в `TELEGRAM_ALLOWED_USER_IDS` | если это вы: сверить `TELEGRAM_CHAT_ID` и `TELEGRAM_ALLOWED_USER_IDS`. Чужим бот не отвечает. Запись не чаще раза в 10 секунд |
+| Бот отвечает «Пишите в тему нужного агента» / «Эта тема не связана с беседой» / «передаётся только текст» | сообщение в General, в тему без беседы (беседа удалена в Paperclip) или не текст | написать текстом в тему нужного агента; в Paperclip ничего не ушло |
+| В теме «⏳ Paperclip недоступен, сообщение в очереди» | Paperclip недоступен или отвечает 5xx/429; сообщение хранится в очереди и отправляется бессрочно | дождаться восстановления |
+| В теме «⏸ Беседа на паузе» | беседа в Paperclip на паузе (`409 Task is paused`) | возобновить беседу в Paperclip и отправить сообщение снова |
+| В теме «❌ Paperclip не принял сообщение…» | `400`/`422`/`403`/`404` от Paperclip | по тексту ошибки; при «ключ бриджа принадлежит не владельцу беседы» ключ выпущен не тем пользователем |
+| Тема беседы появилась заново, старая пропала | тему удалили в Telegram: bridge создаёт её заново (WARN `forum topic not found, recreating`) | ожидаемо |
+| Ответ агента пришёл в тему дважды | падение процесса между отправкой в Telegram и записью в SQLite (документированный компромисс) | ничего |
+| Новая беседа не получила тему сразу | темы создаются через общую очередь (20 вызовов в минуту на группу); при первом запуске с многими беседами — минуты | подождать; `queue_depth` в `HEALTH_FILE` |
+| В логах `tasks did not stop within the grace period` или `pc_outbox did not finish within the grace period` | остановка заняла весь `SHUTDOWN_GRACE` | сообщение вернётся в очередь при старте и отправится с тем же `clientRequestId`; проверьте, что `stop_grace_period` > 2 × `SHUTDOWN_GRACE` (README) |
 
 ## 3. Ротация и отзыв ключей
 
@@ -115,11 +119,11 @@ docker build -t paperclip-telegram-bridge:local .   # новая версия
 docker compose up -d
 ```
 
-При первом старте v1.1.0 bridge сбрасывает незавершённые draft однотекстовых карточек (текст не отправляется) и сообщает об этом в чат; остальные draft сохраняются. Bridge при старте сам применяет миграции схемы; откат на более старую версию с уже мигрированной базой не поддерживается. Перед обновлением делайте backup ([BACKUP_RESTORE.md](BACKUP_RESTORE.md)). Незаконченные формы переживают рестарт: bridge сообщит в чате, какие формы не завершены, и продолжит с того же шага. Правило `stop_grace_period` > 2 × `SHUTDOWN_GRACE` — в README, раздел «Остановка».
+При первом старте v2 миграция схемы 2 удаляет состояние карточек v1 (offset Telegram сохраняется); перед обновлением поменяйте конфигурацию по README, раздел «Переход с v1». Bridge при старте сам применяет миграции схемы; откат на более старую версию с уже мигрированной базой не поддерживается. Перед обновлением делайте backup ([BACKUP_RESTORE.md](BACKUP_RESTORE.md)). Правило `stop_grace_period` > 2 × `SHUTDOWN_GRACE` — в README, раздел «Остановка».
 
 ## 5. Что известно только по документации, а не по реальному запуску
 
-Работа на живом Paperclip с board-ключом, governed-карточки, поведение proxy Xray и потеря питания не проверялись (см. ограничения в README).
+Работа на живом Paperclip с board-ключом, тексты ошибок Telegram для удалённой и закрытой темы, поведение proxy Xray и потеря питания не проверялись (см. ограничения в README и `docs/paperclip-api.md` §8).
 
 ## 6. Развёртывание на хосте с Paperclip и Xray на loopback (`network_mode: host`)
 
@@ -128,7 +132,7 @@ docker compose up -d
 ```bash
 docker build -t paperclip-telegram-bridge:local .
 cp deploy/compose.host-network.example.yml compose.yml   # проверить адреса PAPERCLIP_URL и TELEGRAM_PROXY_URL
-cp .env.example .env                                     # TELEGRAM_CHAT_ID, TELEGRAM_USER_ID, PAPERCLIP_COMPANY_IDS
+cp .env.example .env                                     # TELEGRAM_CHAT_ID, TELEGRAM_ALLOWED_USER_IDS
 # файлы секретов: раздел 3.5
 docker compose run --rm bridge check-config
 docker compose up -d
