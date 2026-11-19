@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use url::Url;
 
-use super::{BotCommand, InlineKeyboard, ReplyMarkup, Result, TelegramApi, TelegramError, Update};
+use super::{ChatInfo, MemberInfo, Result, TelegramApi, TelegramError, Update};
 use crate::config::TelegramConfig;
 
 pub struct HttpTelegramClient {
@@ -113,21 +113,14 @@ fn map_reqwest_error(e: reqwest::Error) -> TelegramError {
 }
 
 fn classify(code: u16, description: String, retry_after: Option<u64>) -> TelegramError {
-    let lower = description.to_ascii_lowercase();
+    use super::topic_errors::{CANT_PARSE_ENTITIES, THREAD_NOT_FOUND, TOPIC_CLOSED, matches};
     match code {
         429 => TelegramError::RateLimited {
             retry_after: Duration::from_secs(retry_after.unwrap_or(1)),
         },
-        400 if lower.contains("message is not modified") => TelegramError::NotModified,
-        400 if lower.contains("message to edit not found")
-            || lower.contains("message_id_invalid")
-            || lower.contains("message can't be edited") =>
-        {
-            TelegramError::MessageNotFound
-        }
-        400 if lower.contains("query is too old") || lower.contains("query id is invalid") => {
-            TelegramError::CallbackExpired
-        }
+        400 if matches(&description, THREAD_NOT_FOUND) => TelegramError::ThreadNotFound,
+        400 if matches(&description, TOPIC_CLOSED) => TelegramError::TopicClosed,
+        400 if matches(&description, CANT_PARSE_ENTITIES) => TelegramError::CantParseEntities,
         400 => TelegramError::BadRequest {
             description: description.chars().take(200).collect(),
         },
@@ -141,27 +134,12 @@ fn classify(code: u16, description: String, retry_after: Option<u64>) -> Telegra
     }
 }
 
-fn markup_json(markup: Option<&ReplyMarkup>) -> Option<Value> {
-    match markup? {
-        ReplyMarkup::Inline(kb) => Some(serde_json::to_value(kb).unwrap_or(Value::Null)),
-        ReplyMarkup::ForceReply => Some(json!({"force_reply": true, "selective": true})),
-    }
-}
-
-fn keyboard_json(kb: Option<&InlineKeyboard>) -> Value {
-    match kb {
-        Some(kb) => serde_json::to_value(kb).unwrap_or(Value::Null),
-        // An empty keyboard removes the buttons.
-        None => json!({"inline_keyboard": []}),
-    }
-}
-
 impl TelegramApi for HttpTelegramClient {
     async fn get_updates(&self, offset: i64, timeout: Duration) -> Result<Vec<Update>> {
         let body = json!({
             "offset": offset,
             "timeout": timeout.as_secs(),
-            "allowed_updates": ["message", "callback_query"],
+            "allowed_updates": ["message"],
         });
         let v = self
             .call("getUpdates", body, timeout + Duration::from_secs(10))
@@ -177,7 +155,6 @@ impl TelegramApi for HttpTelegramClient {
                         Some(Update {
                             update_id: u.get("update_id")?.as_i64()?,
                             message: None,
-                            callback_query: None,
                         })
                     })
             })
@@ -187,17 +164,20 @@ impl TelegramApi for HttpTelegramClient {
     async fn send_message(
         &self,
         chat_id: i64,
-        html: &str,
-        markup: Option<&ReplyMarkup>,
+        thread_id: Option<i64>,
+        text: &str,
+        html: bool,
     ) -> Result<i64> {
         let mut body = json!({
             "chat_id": chat_id,
-            "text": html,
-            "parse_mode": "HTML",
+            "text": text,
             "link_preview_options": {"is_disabled": true},
         });
-        if let Some(m) = markup_json(markup) {
-            body["reply_markup"] = m;
+        if html {
+            body["parse_mode"] = json!("HTML");
+        }
+        if let Some(t) = thread_id {
+            body["message_thread_id"] = json!(t);
         }
         let v = self.call("sendMessage", body, self.request_timeout).await?;
         v.get("message_id")
@@ -205,70 +185,61 @@ impl TelegramApi for HttpTelegramClient {
             .ok_or(TelegramError::Decode)
     }
 
-    async fn edit_message_text(
-        &self,
-        chat_id: i64,
-        message_id: i64,
-        html: &str,
-        keyboard: Option<&InlineKeyboard>,
-    ) -> Result<()> {
-        let body = json!({
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": html,
-            "parse_mode": "HTML",
-            "link_preview_options": {"is_disabled": true},
-            "reply_markup": keyboard_json(keyboard),
-        });
-        self.call("editMessageText", body, self.request_timeout)
+    async fn create_forum_topic(&self, chat_id: i64, name: &str) -> Result<i64> {
+        let body = json!({"chat_id": chat_id, "name": name});
+        let v = self
+            .call("createForumTopic", body, self.request_timeout)
+            .await?;
+        v.get("message_thread_id")
+            .and_then(Value::as_i64)
+            .ok_or(TelegramError::Decode)
+    }
+
+    async fn reopen_forum_topic(&self, chat_id: i64, thread_id: i64) -> Result<()> {
+        let body = json!({"chat_id": chat_id, "message_thread_id": thread_id});
+        self.call("reopenForumTopic", body, self.request_timeout)
             .await
             .map(|_| ())
     }
 
-    async fn edit_reply_markup(
-        &self,
-        chat_id: i64,
-        message_id: i64,
-        keyboard: Option<&InlineKeyboard>,
-    ) -> Result<()> {
-        let body = json!({
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "reply_markup": keyboard_json(keyboard),
-        });
-        self.call("editMessageReplyMarkup", body, self.request_timeout)
-            .await
-            .map(|_| ())
+    async fn get_me(&self) -> Result<i64> {
+        let v = self.call("getMe", json!({}), self.request_timeout).await?;
+        v.get("id").and_then(Value::as_i64).ok_or(TelegramError::Decode)
     }
 
-    async fn answer_callback_query(
-        &self,
-        callback_query_id: &str,
-        text: Option<&str>,
-    ) -> Result<()> {
-        let mut body = json!({"callback_query_id": callback_query_id});
-        if let Some(t) = text {
-            body["text"] = json!(t.chars().take(200).collect::<String>());
-        }
-        self.call("answerCallbackQuery", body, self.request_timeout)
-            .await
-            .map(|_| ())
+    async fn get_chat(&self, chat_id: i64) -> Result<ChatInfo> {
+        let v = self
+            .call("getChat", json!({"chat_id": chat_id}), self.request_timeout)
+            .await?;
+        Ok(ChatInfo {
+            kind: v
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or(TelegramError::Decode)?
+                .to_string(),
+            is_forum: v.get("is_forum").and_then(Value::as_bool).unwrap_or(false),
+        })
     }
 
-    async fn set_my_commands(&self, chat_id: i64, commands: &[BotCommand]) -> Result<()> {
-        let body = json!({
-            "commands": commands,
-            "scope": {"type": "chat", "chat_id": chat_id},
-        });
-        self.call("setMyCommands", body, self.request_timeout)
-            .await
-            .map(|_| ())
-    }
-
-    async fn get_me(&self) -> Result<()> {
-        self.call("getMe", json!({}), self.request_timeout)
-            .await
-            .map(|_| ())
+    async fn get_chat_member(&self, chat_id: i64, user_id: i64) -> Result<MemberInfo> {
+        let v = self
+            .call(
+                "getChatMember",
+                json!({"chat_id": chat_id, "user_id": user_id}),
+                self.request_timeout,
+            )
+            .await?;
+        Ok(MemberInfo {
+            status: v
+                .get("status")
+                .and_then(Value::as_str)
+                .ok_or(TelegramError::Decode)?
+                .to_string(),
+            can_manage_topics: v
+                .get("can_manage_topics")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
     }
 }
 
@@ -285,23 +256,35 @@ mod tests {
             }
         );
         assert_eq!(
-            classify(400, "Bad Request: message is not modified: x".into(), None),
-            TelegramError::NotModified
+            classify(400, "Bad Request: message thread not found".into(), None),
+            TelegramError::ThreadNotFound
         );
         assert_eq!(
-            classify(400, "Bad Request: message to edit not found".into(), None),
-            TelegramError::MessageNotFound
+            classify(400, "Bad Request: MESSAGE THREAD NOT FOUND".into(), None),
+            TelegramError::ThreadNotFound
+        );
+        assert_eq!(
+            classify(400, "Bad Request: TOPIC_DELETED".into(), None),
+            TelegramError::ThreadNotFound
+        );
+        assert_eq!(
+            classify(400, "Bad Request: TOPIC_CLOSED".into(), None),
+            TelegramError::TopicClosed
+        );
+        assert_eq!(
+            classify(400, "bad request: topic_closed".into(), None),
+            TelegramError::TopicClosed
         );
         assert_eq!(
             classify(
                 400,
-                "Bad Request: query is too old and response timeout expired".into(),
+                "Bad Request: can't parse entities: unsupported start tag".into(),
                 None
             ),
-            TelegramError::CallbackExpired
+            TelegramError::CantParseEntities
         );
         assert!(matches!(
-            classify(400, "Bad Request: can't parse entities".into(), None),
+            classify(400, "Bad Request: chat not found".into(), None),
             TelegramError::BadRequest { .. }
         ));
         assert_eq!(
@@ -317,7 +300,7 @@ mod tests {
             TelegramError::Conflict
         );
         assert_eq!(
-            classify(403, "Forbidden: bot was blocked".into(), None),
+            classify(403, "Forbidden: bot was kicked from the supergroup chat".into(), None),
             TelegramError::Forbidden
         );
         assert!(classify(502, String::new(), None).is_transient());
