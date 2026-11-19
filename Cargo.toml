@@ -1,6 +1,6 @@
 [package]
 name = "paperclip-telegram-bridge"
-version = "1.1.0"
+version = "2.0.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.100"
@@ -37,6 +37,7 @@ url = "2.5"
 humantime = "2.4"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 sha2 = "0.11"
+uuid = { version = "1", default-features = false, features = ["v5", "std"] }
 
 [dev-dependencies]
 wiremock = "0.6"
