@@ -2,7 +2,7 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -21,16 +21,41 @@ pub struct HealthState {
     pub written_at: String,
     pub last_telegram_ok_at: Option<String>,
     pub last_paperclip_ok_at: Option<String>,
+    /// Last completed discovery (companies and agents) of all keys.
+    #[serde(default)]
+    pub last_discovery_ok_at: Option<String>,
     pub paperclip_auth_ok: bool,
+    /// The supergroup passed the start checks (forum, bot admin with
+    /// `can_manage_topics`).
+    #[serde(default = "yes")]
+    pub telegram_group_ok: bool,
+    /// The bot may write to the group (no `403` on sending).
+    #[serde(default = "yes")]
+    pub telegram_send_ok: bool,
+    /// Agent Chat is enabled in Paperclip.
+    #[serde(default = "yes")]
+    pub agent_chat_ok: bool,
+    /// Pieces waiting for Telegram.
+    #[serde(default)]
+    pub queue_depth: u64,
 }
 
-/// Shared, lock-free record of the last successful calls.
+fn yes() -> bool {
+    true
+}
+
+/// Shared, lock-free record of the last successful calls and known problems.
 #[derive(Debug)]
 pub struct HealthTracker {
     started_at: i64,
     telegram_ok: AtomicI64,
     paperclip_ok: AtomicI64,
+    discovery_ok: AtomicI64,
     auth_ok: AtomicBool,
+    group_ok: AtomicBool,
+    send_ok: AtomicBool,
+    agent_chat_ok: AtomicBool,
+    queue_depth: AtomicU64,
 }
 
 impl Default for HealthTracker {
@@ -39,33 +64,63 @@ impl Default for HealthTracker {
     }
 }
 
+fn stamp(a: &AtomicI64) {
+    a.store(timeutil::now().unix_timestamp(), Ordering::Relaxed);
+}
+
 impl HealthTracker {
     pub fn new() -> Self {
         Self {
             started_at: timeutil::now().unix_timestamp(),
             telegram_ok: AtomicI64::new(0),
             paperclip_ok: AtomicI64::new(0),
+            discovery_ok: AtomicI64::new(0),
             auth_ok: AtomicBool::new(true),
+            group_ok: AtomicBool::new(true),
+            send_ok: AtomicBool::new(true),
+            agent_chat_ok: AtomicBool::new(true),
+            queue_depth: AtomicU64::new(0),
         }
     }
 
     pub fn telegram_ok(&self) {
-        self.telegram_ok
-            .store(timeutil::now().unix_timestamp(), Ordering::Relaxed);
+        stamp(&self.telegram_ok);
     }
 
     pub fn paperclip_ok(&self) {
-        self.paperclip_ok
-            .store(timeutil::now().unix_timestamp(), Ordering::Relaxed);
-        self.auth_ok.store(true, Ordering::Relaxed);
+        stamp(&self.paperclip_ok);
     }
 
-    pub fn paperclip_auth_failed(&self) {
-        self.auth_ok.store(false, Ordering::Relaxed);
+    pub fn discovery_ok(&self) {
+        stamp(&self.discovery_ok);
+    }
+
+    pub fn set_paperclip_auth_ok(&self, ok: bool) {
+        self.auth_ok.store(ok, Ordering::Relaxed);
     }
 
     pub fn is_paperclip_auth_ok(&self) -> bool {
         self.auth_ok.load(Ordering::Relaxed)
+    }
+
+    pub fn set_telegram_group_ok(&self, ok: bool) {
+        self.group_ok.store(ok, Ordering::Relaxed);
+    }
+
+    pub fn set_telegram_send_ok(&self, ok: bool) {
+        self.send_ok.store(ok, Ordering::Relaxed);
+    }
+
+    pub fn is_telegram_send_ok(&self) -> bool {
+        self.send_ok.load(Ordering::Relaxed)
+    }
+
+    pub fn set_agent_chat_ok(&self, ok: bool) {
+        self.agent_chat_ok.store(ok, Ordering::Relaxed);
+    }
+
+    pub fn set_queue_depth(&self, n: u64) {
+        self.queue_depth.store(n, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> HealthState {
@@ -81,7 +136,12 @@ impl HealthTracker {
             written_at: timeutil::now_string(),
             last_telegram_ok_at: ts(self.telegram_ok.load(Ordering::Relaxed)),
             last_paperclip_ok_at: ts(self.paperclip_ok.load(Ordering::Relaxed)),
+            last_discovery_ok_at: ts(self.discovery_ok.load(Ordering::Relaxed)),
             paperclip_auth_ok: self.auth_ok.load(Ordering::Relaxed),
+            telegram_group_ok: self.group_ok.load(Ordering::Relaxed),
+            telegram_send_ok: self.send_ok.load(Ordering::Relaxed),
+            agent_chat_ok: self.agent_chat_ok.load(Ordering::Relaxed),
+            queue_depth: self.queue_depth.load(Ordering::Relaxed),
         }
     }
 }
@@ -111,7 +171,16 @@ pub fn check(path: &Path, max_stale: Duration, now: OffsetDateTime) -> Result<()
         ));
     }
     if !state.paperclip_auth_ok {
-        return Err("Paperclip key rejected (401/403)".into());
+        return Err("Paperclip key rejected (401)".into());
+    }
+    if !state.agent_chat_ok {
+        return Err("Agent Chat is disabled in Paperclip".into());
+    }
+    if !state.telegram_group_ok {
+        return Err("Telegram supergroup check failed (forum, bot admin with can_manage_topics)".into());
+    }
+    if !state.telegram_send_ok {
+        return Err("Telegram refuses messages to the supergroup (403)".into());
     }
     // Before the first success, count from process start.
     let started = age(&state.started_at).ok_or("health file has no start time")?;
@@ -142,7 +211,12 @@ mod tests {
             written_at: at(written),
             last_telegram_ok_at: tg.map(at),
             last_paperclip_ok_at: pc.map(at),
+            last_discovery_ok_at: None,
             paperclip_auth_ok: true,
+            telegram_group_ok: true,
+            telegram_send_ok: true,
+            agent_chat_ok: true,
+            queue_depth: 0,
         }
     }
 
@@ -178,6 +252,21 @@ mod tests {
         write_file(&p, &s).unwrap();
         assert!(check(&p, max, now).unwrap_err().contains("rejected"));
 
+        for (flag, reason) in [
+            (0, "Agent Chat"),
+            (1, "supergroup"),
+            (2, "403"),
+        ] {
+            let mut s = state(now, 1, Some(1), Some(1));
+            match flag {
+                0 => s.agent_chat_ok = false,
+                1 => s.telegram_group_ok = false,
+                _ => s.telegram_send_ok = false,
+            }
+            write_file(&p, &s).unwrap();
+            assert!(check(&p, max, now).unwrap_err().contains(reason), "{reason}");
+        }
+
         std::fs::write(&p, b"{not json").unwrap();
         assert!(check(&p, max, now).unwrap_err().contains("corrupt"));
     }
@@ -198,11 +287,28 @@ mod tests {
         let t = HealthTracker::new();
         assert!(t.snapshot().last_telegram_ok_at.is_none());
         t.telegram_ok();
-        t.paperclip_auth_failed();
+        t.set_paperclip_auth_ok(false);
+        t.set_queue_depth(7);
+        t.discovery_ok();
         let s = t.snapshot();
         assert!(s.last_telegram_ok_at.is_some());
+        assert!(s.last_discovery_ok_at.is_some());
         assert!(!s.paperclip_auth_ok);
-        t.paperclip_ok();
+        assert_eq!(s.queue_depth, 7);
+        t.set_paperclip_auth_ok(true);
         assert!(t.snapshot().paperclip_auth_ok);
+    }
+
+    #[test]
+    fn v1_health_file_is_still_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("health.json");
+        let now = timeutil::now();
+        let v1 = serde_json::json!({
+            "pid": 1, "started_at": timeutil::format(now), "written_at": timeutil::format(now),
+            "last_telegram_ok_at": null, "last_paperclip_ok_at": null, "paperclip_auth_ok": true
+        });
+        std::fs::write(&p, v1.to_string()).unwrap();
+        assert_eq!(check(&p, Duration::from_secs(300), now), Ok(()));
     }
 }

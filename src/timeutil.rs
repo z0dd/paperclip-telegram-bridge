@@ -7,9 +7,20 @@ pub fn now() -> OffsetDateTime {
     OffsetDateTime::now_utc()
 }
 
+/// Fixed width (`YYYY-MM-DDTHH:MM:SS.mmmZ`, UTC), so that stored times
+/// compare correctly as strings in SQL.
 pub fn format(t: OffsetDateTime) -> String {
-    t.format(&Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
+    let t = t.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.millisecond()
+    )
 }
 
 pub fn now_string() -> String {
@@ -63,6 +74,8 @@ mod tests {
         assert_eq!(ddmm_hhmm(t), "15.11 17:04 UTC");
         assert_eq!(full(t), "2026-11-15 17:04 UTC");
         assert_eq!(parse(&format(t)), Some(t));
+        assert_eq!(format(t), "2026-11-15T17:04:05.123Z");
+        assert!(format(parse("2026-11-15T17:04:05Z").unwrap()) < format(t));
         assert!(parse("yesterday").is_none());
     }
 }

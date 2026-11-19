@@ -1,10 +1,10 @@
-//! `getUpdates` long polling → dialog, one update at a time, in order.
+//! `getUpdates` long polling → inbound, one update at a time, in order.
 
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use super::{Ctx, dialog};
+use super::{Ctx, inbound};
 use crate::paperclip::PaperclipApi;
 use crate::retry::{Backoff, rate_limit_jitter};
 use crate::telegram::{TelegramApi, TelegramError};
@@ -40,7 +40,7 @@ pub async fn run<P: PaperclipApi, T: TelegramApi>(ctx: Ctx<P, T>, cancel: Cancel
                     if cancel.is_cancelled() {
                         break;
                     }
-                    if let Err(e) = dialog::handle_update(&ctx, &u).await {
+                    if let Err(e) = inbound::handle_update(&ctx, &u).await {
                         // Not committed: stop here and fetch again from the offset.
                         tracing::warn!(update_id = u.update_id, error = %e, "update processing failed");
                         failed = true;

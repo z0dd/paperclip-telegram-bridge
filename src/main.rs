@@ -47,14 +47,15 @@ fn check_config() -> ExitCode {
                 eprintln!("configuration error: {e}");
                 return ExitCode::from(2);
             }
+            for var in &cfg.ignored_vars {
+                println!("warning: {var} is no longer used in v2, remove it");
+            }
             println!(
-                "configuration OK: {} compan{}, telegram proxy scheme {}",
-                cfg.paperclip.company_ids.len(),
-                if cfg.paperclip.company_ids.len() == 1 {
-                    "y"
-                } else {
-                    "ies"
-                },
+                "configuration OK: {} Paperclip key{}, {} allowed Telegram user{}, telegram proxy scheme {}",
+                cfg.paperclip.tokens.len(),
+                if cfg.paperclip.tokens.len() == 1 { "" } else { "s" },
+                cfg.telegram.allowed_user_ids.len(),
+                if cfg.telegram.allowed_user_ids.len() == 1 { "" } else { "s" },
                 cfg.telegram.proxy.scheme()
             );
             ExitCode::SUCCESS
@@ -79,7 +80,6 @@ fn revoke_paperclip_key() -> ExitCode {
         &cfg.url,
         cfg.token,
         cfg.connect_timeout,
-        cfg.request_timeout,
         cfg.request_timeout,
     ) {
         Ok(c) => c,
@@ -161,10 +161,10 @@ fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
         tracing::info!(
-            companies = cfg.paperclip.company_ids.len(),
+            version = env!("CARGO_PKG_VERSION"),
+            paperclip_keys = cfg.paperclip.tokens.len(),
+            allowed_users = cfg.telegram.allowed_user_ids.len(),
             proxy_scheme = cfg.telegram.proxy.scheme(),
-            governed_enabled = cfg.governed.enabled,
-            destructive_mode = ?cfg.governed.destructive_mode,
             "bridge starting"
         );
         match app::run(cfg, token).await {

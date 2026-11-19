@@ -34,7 +34,9 @@ pub fn hit(_point: &'static str) -> bool {
     false
 }
 
-/// After `sendMessage` succeeded, before the delivery is committed as `sent`.
+/// After `sendMessage` succeeded, before the piece is committed as `sent`.
 pub const AFTER_SEND_BEFORE_COMMIT: &str = "after_send_before_commit";
-/// After the Paperclip HTTP call succeeded, before the outbox is committed.
+/// After the comment was posted to Paperclip, before `pc_outbox` is committed.
 pub const AFTER_HTTP_BEFORE_OUTBOX_COMMIT: &str = "after_http_before_outbox_commit";
+/// After comments were read, before the cursor and the pieces are committed.
+pub const AFTER_READ_BEFORE_CURSOR_COMMIT: &str = "after_read_before_cursor_commit";
