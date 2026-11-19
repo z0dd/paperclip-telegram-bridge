@@ -4,7 +4,6 @@
 pub const CHUNK_LIMIT: usize = 3500;
 /// Telegram limit for one message after entity parsing.
 pub const TELEGRAM_LIMIT: usize = 4096;
-pub const BUTTON_MAX_CHARS: usize = 32;
 
 /// Escapes `&`, `<`, `>` and `"`; everything else is plain text.
 pub fn escape(s: &str) -> String {
@@ -112,12 +111,6 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     format!("{}…", kept.trim_end())
 }
 
-/// Button caption: single line, at most 32 characters.
-pub fn button_text(s: &str) -> String {
-    let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_chars(&one_line, BUTTON_MAX_CHARS)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,11 +174,5 @@ mod tests {
         assert_eq!(truncate_chars("abcdef", 4), "abc…");
         assert_eq!(truncate_chars("abc", 4), "abc");
         assert_eq!(truncate_utf16("🚀🚀🚀", 4), "🚀…");
-        assert_eq!(
-            button_text("1. a very long option label that exceeds"),
-            "1. a very long option label tha…"
-        );
-        assert_eq!(button_text("multi\nline"), "multi line");
-        assert!(button_text(&"я".repeat(100)).chars().count() <= BUTTON_MAX_CHARS);
     }
 }
