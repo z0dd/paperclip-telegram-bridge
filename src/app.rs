@@ -16,7 +16,10 @@ use crate::telegram::{HttpTelegramClient, TelegramApi};
 pub async fn run(cfg: Config, token: CancellationToken) -> Result<(), String> {
     let cfg = Arc::new(cfg);
     for var in &cfg.ignored_vars {
-        tracing::warn!(variable = var, "variable of v1 is no longer used, remove it");
+        tracing::warn!(
+            variable = var,
+            "variable of v1 is no longer used, remove it"
+        );
     }
     let store = Store::open(&cfg.state_path).map_err(|e| format!("cannot open state: {e}"))?;
     let rec = store

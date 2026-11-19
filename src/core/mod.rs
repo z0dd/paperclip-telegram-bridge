@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
 use secrecy::ExposeSecret;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc};
 
 use crate::config::Config;

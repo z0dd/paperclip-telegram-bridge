@@ -139,9 +139,18 @@ mod tests {
     #[test]
     fn rejects_foreign_chat_and_user() {
         let a = allowlist();
-        assert_eq!(a.check(&msg(-100999, USER)).unwrap_err(), Rejection::ChatMismatch);
-        assert_eq!(a.check(&msg(USER, USER)).unwrap_err(), Rejection::ChatMismatch);
-        assert_eq!(a.check(&msg(CHAT, 999)).unwrap_err(), Rejection::UserMismatch);
+        assert_eq!(
+            a.check(&msg(-100999, USER)).unwrap_err(),
+            Rejection::ChatMismatch
+        );
+        assert_eq!(
+            a.check(&msg(USER, USER)).unwrap_err(),
+            Rejection::ChatMismatch
+        );
+        assert_eq!(
+            a.check(&msg(CHAT, 999)).unwrap_err(),
+            Rejection::UserMismatch
+        );
         let anonymous = update(json!({"update_id": 2, "message": {
             "message_id": 6, "chat": {"id": CHAT, "type": "supergroup"}, "text": "x"}}));
         assert_eq!(a.check(&anonymous).unwrap_err(), Rejection::UserMismatch);

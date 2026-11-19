@@ -340,10 +340,8 @@ impl Store {
         updated_at: Option<String>,
         hot_until: String,
     ) -> Result<()> {
-        self.call(move |c| {
-            sqlite::set_updated_at(c, &issue_id, updated_at.as_deref(), &hot_until)
-        })
-        .await
+        self.call(move |c| sqlite::set_updated_at(c, &issue_id, updated_at.as_deref(), &hot_until))
+            .await
     }
 
     /// Extends the hot window (never shortens it).
@@ -354,7 +352,8 @@ impl Store {
 
     /// Of `ids`, those already in `seen_comments` of the conversation.
     pub async fn seen_of(&self, issue_id: String, ids: Vec<String>) -> Result<Vec<String>> {
-        self.call(move |c| sqlite::seen_of(c, &issue_id, &ids)).await
+        self.call(move |c| sqlite::seen_of(c, &issue_id, &ids))
+            .await
     }
 
     /// Seen ids, Telegram pieces and the cursor in one transaction.
@@ -436,8 +435,10 @@ impl Store {
 
     /// `done`: body wiped, comment id kept.
     pub async fn message_done(&self, id: i64, comment_id: Option<String>) -> Result<()> {
-        self.call(move |c| sqlite::message_finish(c, id, PcStatus::Done, comment_id.as_deref(), None))
-            .await
+        self.call(move |c| {
+            sqlite::message_finish(c, id, PcStatus::Done, comment_id.as_deref(), None)
+        })
+        .await
     }
 
     /// `rejected`: body wiped, error class kept.

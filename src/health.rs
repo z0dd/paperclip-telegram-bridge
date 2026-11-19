@@ -177,7 +177,9 @@ pub fn check(path: &Path, max_stale: Duration, now: OffsetDateTime) -> Result<()
         return Err("Agent Chat is disabled in Paperclip".into());
     }
     if !state.telegram_group_ok {
-        return Err("Telegram supergroup check failed (forum, bot admin with can_manage_topics)".into());
+        return Err(
+            "Telegram supergroup check failed (forum, bot admin with can_manage_topics)".into(),
+        );
     }
     if !state.telegram_send_ok {
         return Err("Telegram refuses messages to the supergroup (403)".into());
@@ -252,11 +254,7 @@ mod tests {
         write_file(&p, &s).unwrap();
         assert!(check(&p, max, now).unwrap_err().contains("rejected"));
 
-        for (flag, reason) in [
-            (0, "Agent Chat"),
-            (1, "supergroup"),
-            (2, "403"),
-        ] {
+        for (flag, reason) in [(0, "Agent Chat"), (1, "supergroup"), (2, "403")] {
             let mut s = state(now, 1, Some(1), Some(1));
             match flag {
                 0 => s.agent_chat_ok = false,
@@ -264,7 +262,10 @@ mod tests {
                 _ => s.telegram_send_ok = false,
             }
             write_file(&p, &s).unwrap();
-            assert!(check(&p, max, now).unwrap_err().contains(reason), "{reason}");
+            assert!(
+                check(&p, max, now).unwrap_err().contains(reason),
+                "{reason}"
+            );
         }
 
         std::fs::write(&p, b"{not json").unwrap();

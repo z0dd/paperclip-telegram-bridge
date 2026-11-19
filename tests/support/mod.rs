@@ -15,19 +15,20 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 pub const BOT_TOKEN: &str = "123456:TEST-placeholder-token";
-pub const CHAT: i64 = 111;
+pub const CHAT: i64 = -1001234567890;
 pub const USER: i64 = 111;
 
 pub fn telegram_config(api_base: &str, proxy: &str) -> TelegramConfig {
     TelegramConfig {
         token: SecretString::from(BOT_TOKEN),
         chat_id: CHAT,
-        user_id: USER,
+        allowed_user_ids: vec![USER],
         proxy: ProxyUrl::parse(proxy).unwrap(),
         api_base: api_base.parse().unwrap(),
         long_poll_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(3),
         connect_timeout: Duration::from_secs(2),
+        group_min_interval: Duration::from_secs(3),
     }
 }
 

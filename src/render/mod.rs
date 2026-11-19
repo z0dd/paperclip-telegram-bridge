@@ -43,7 +43,10 @@ pub fn issue_url(identifier: &str, cfg: &RenderConfig) -> Option<Url> {
     let prefix = identifier.split('-').next().unwrap_or(identifier);
     let mut url = base.clone();
     if let Ok(mut p) = url.path_segments_mut() {
-        p.pop_if_empty().push(prefix).push("issues").push(identifier);
+        p.pop_if_empty()
+            .push(prefix)
+            .push("issues")
+            .push(identifier);
     }
     Some(url)
 }
@@ -95,11 +98,16 @@ pub fn comment_chunks(body: &str, identifier: Option<&str>, cfg: &RenderConfig) 
         .collect();
     if cut && let Some(last) = chunks.last_mut() {
         let link = identifier.and_then(|i| issue_url(i, cfg));
-        last.html.push_str("\n\n<i>… сообщение обрезано, полностью — в Paperclip");
-        last.plain.push_str("\n\n… сообщение обрезано, полностью — в Paperclip");
+        last.html
+            .push_str("\n\n<i>… сообщение обрезано, полностью — в Paperclip");
+        last.plain
+            .push_str("\n\n… сообщение обрезано, полностью — в Paperclip");
         if let Some(url) = link {
-            last.html
-                .push_str(&format!(": <a href=\"{}\">{}</a>", escape(url.as_str()), escape(identifier.unwrap_or_default())));
+            last.html.push_str(&format!(
+                ": <a href=\"{}\">{}</a>",
+                escape(url.as_str()),
+                escape(identifier.unwrap_or_default())
+            ));
             last.plain.push_str(&format!(": {url}"));
         }
         last.html.push_str("</i>");
@@ -115,8 +123,7 @@ pub mod notices {
         "ℹ️ Эта тема не связана с беседой Paperclip, сообщение не передано.";
     pub const TEXT_ONLY: &str =
         "ℹ️ В Paperclip передаётся только текст: фото, файлы и стикеры не поддерживаются.";
-    pub const PAUSED: &str =
-        "⏸ Беседа на паузе, сообщение не передано. Возобновите беседу в Paperclip и отправьте снова.";
+    pub const PAUSED: &str = "⏸ Беседа на паузе, сообщение не передано. Возобновите беседу в Paperclip и отправьте снова.";
     pub const NOT_OWNER: &str = "❌ Paperclip не принял сообщение: ключ бриджа принадлежит не владельцу беседы. Проверьте настройку ключа.";
     pub const NOT_FOUND: &str =
         "❌ Беседа не найдена в Paperclip или Agent Chat выключен, сообщение не передано.";
@@ -166,7 +173,11 @@ mod tests {
         let chunks = comment_chunks(&body, None, &cfg(10));
         assert!(chunks.len() > 1);
         for c in &chunks {
-            assert!(visible_len(&c.html) <= text::TELEGRAM_LIMIT, "{}", visible_len(&c.html));
+            assert!(
+                visible_len(&c.html) <= text::TELEGRAM_LIMIT,
+                "{}",
+                visible_len(&c.html)
+            );
             assert!(utf16_len(&c.plain) <= text::TELEGRAM_LIMIT);
         }
     }

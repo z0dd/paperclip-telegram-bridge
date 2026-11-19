@@ -50,7 +50,14 @@ impl HttpPaperclipClient {
     ) -> std::result::Result<Vec<Self>, String> {
         cfg.tokens
             .iter()
-            .map(|t| Self::new(&cfg.url, t.clone(), cfg.connect_timeout, cfg.request_timeout))
+            .map(|t| {
+                Self::new(
+                    &cfg.url,
+                    t.clone(),
+                    cfg.connect_timeout,
+                    cfg.request_timeout,
+                )
+            })
             .collect()
     }
 

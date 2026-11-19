@@ -6,9 +6,7 @@ mod support;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bridge::telegram::{
-    HttpTelegramClient, InlineKeyboard, ReplyMarkup, TelegramApi, TelegramError,
-};
+use bridge::telegram::{HttpTelegramClient, TelegramApi, TelegramError};
 use serde_json::json;
 use support::proxy::ForwardProxy;
 use support::{BOT_TOKEN, CHAT, mount_get_me, telegram_config};
@@ -44,79 +42,150 @@ async fn unavailable_proxy_means_zero_direct_requests() {
     );
 }
 
+fn ok(result: serde_json::Value) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": result}))
+}
+
+fn fail(code: u16, description: &str) -> ResponseTemplate {
+    ResponseTemplate::new(code)
+        .set_body_json(json!({"ok": false, "error_code": code, "description": description}))
+}
+
 #[tokio::test]
 async fn every_request_goes_through_the_proxy() {
     let telegram = MockServer::start().await;
     mount_get_me(&telegram).await;
+    let tg = |m: &str| path(format!("/bot{BOT_TOKEN}/{m}"));
     Mock::given(method("POST"))
-        .and(path(format!("/bot{BOT_TOKEN}/sendMessage")))
-        .and(body_partial_json(json!({"chat_id": CHAT, "parse_mode": "HTML"})))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "ok": true, "result": {"message_id": 42, "chat": {"id": CHAT, "type": "private"}, "date": 0}
-        })))
-        .mount(&telegram)
-        .await;
-    Mock::given(method("POST"))
-        .and(path(format!("/bot{BOT_TOKEN}/getUpdates")))
+        .and(tg("sendMessage"))
         .and(body_partial_json(
-            json!({"offset": 5, "allowed_updates": ["message", "callback_query"]}),
+            json!({"chat_id": CHAT, "message_thread_id": 7, "parse_mode": "HTML"}),
         ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "ok": true, "result": [
-                {"update_id": 5, "message": {"message_id": 1, "from": {"id": 111}, "chat": {"id": 111, "type": "private"}, "text": "/help"}},
-                {"update_id": 6, "edited_message": {"message_id": 1}},
-                {"update_id": 7, "callback_query": {"id": "q", "from": {"id": 111}, "data": "v1:ac:1:0",
-                  "message": {"message_id": 1, "chat": {"id": 111, "type": "private"}}}}
-            ]
-        })))
+        .respond_with(ok(
+            json!({"message_id": 42, "chat": {"id": CHAT, "type": "supergroup"}, "date": 0}),
+        ))
         .mount(&telegram)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/bot{BOT_TOKEN}/editMessageText")))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "ok": false, "error_code": 400, "description": "Bad Request: message is not modified"
-        })))
+        .and(tg("sendMessage"))
+        .and(body_partial_json(json!({"message_thread_id": 8})))
+        .respond_with(fail(400, "Bad Request: message thread not found"))
         .mount(&telegram)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/bot{BOT_TOKEN}/answerCallbackQuery")))
+        .and(tg("sendMessage"))
+        .and(body_partial_json(json!({"message_thread_id": 9})))
+        .respond_with(fail(400, "Bad Request: TOPIC_CLOSED"))
+        .mount(&telegram)
+        .await;
+    Mock::given(method("POST"))
+        .and(tg("createForumTopic"))
+        .and(body_partial_json(
+            json!({"chat_id": CHAT, "name": "PET · Lead"}),
+        ))
+        .respond_with(ok(
+            json!({"message_thread_id": 77, "name": "PET · Lead", "icon_color": 1}),
+        ))
+        .mount(&telegram)
+        .await;
+    Mock::given(method("POST"))
+        .and(tg("reopenForumTopic"))
         .respond_with(ResponseTemplate::new(429).set_body_json(json!({
             "ok": false, "error_code": 429, "description": "Too Many Requests: retry after 3",
             "parameters": {"retry_after": 3}
         })))
         .mount(&telegram)
         .await;
+    Mock::given(method("POST"))
+        .and(tg("getChat"))
+        .respond_with(ok(
+            json!({"id": CHAT, "type": "supergroup", "is_forum": true}),
+        ))
+        .mount(&telegram)
+        .await;
+    Mock::given(method("POST"))
+        .and(tg("getChatMember"))
+        .and(body_partial_json(json!({"chat_id": CHAT, "user_id": 1})))
+        .respond_with(ok(
+            json!({"status": "administrator", "can_manage_topics": true,
+                               "user": {"id": 1, "is_bot": true}}),
+        ))
+        .mount(&telegram)
+        .await;
+    Mock::given(method("POST"))
+        .and(tg("getUpdates"))
+        .and(body_partial_json(
+            json!({"offset": 5, "allowed_updates": ["message"]}),
+        ))
+        .respond_with(ok(json!([
+            {"update_id": 5, "message": {"message_id": 1, "from": {"id": 111},
+              "chat": {"id": CHAT, "type": "supergroup"}, "message_thread_id": 7,
+              "is_topic_message": true, "text": "hi"}},
+            {"update_id": 6, "edited_message": {"message_id": 1}}
+        ])))
+        .mount(&telegram)
+        .await;
 
     let proxy = ForwardProxy::start().await;
     let client = HttpTelegramClient::new(&telegram_config(&telegram.uri(), &proxy.url())).unwrap();
-    client.get_me().await.unwrap();
-    let id = client
-        .send_message(
-            CHAT,
-            "<b>hi</b>",
-            Some(&ReplyMarkup::Inline(InlineKeyboard::default())),
-        )
-        .await
-        .unwrap();
-    assert_eq!(id, 42);
-    let updates = client.get_updates(5, Duration::from_secs(1)).await.unwrap();
-    assert_eq!(updates.len(), 3, "unknown update kinds keep their id");
-    assert_eq!(updates[1].update_id, 6);
-    assert!(updates[1].message.is_none() && updates[1].callback_query.is_none());
+    let bot = client.get_me().await.unwrap();
+    assert_eq!(bot, 1);
     assert_eq!(
-        client.edit_message_text(CHAT, 1, "x", None).await,
-        Err(TelegramError::NotModified)
+        client.send_message(CHAT, Some(7), "<b>hi</b>", true).await,
+        Ok(42)
     );
     assert_eq!(
-        client.answer_callback_query("q", Some("ok")).await,
+        client.send_message(CHAT, Some(8), "x", true).await,
+        Err(TelegramError::ThreadNotFound)
+    );
+    assert_eq!(
+        client.send_message(CHAT, Some(9), "x", true).await,
+        Err(TelegramError::TopicClosed)
+    );
+    assert_eq!(client.create_forum_topic(CHAT, "PET · Lead").await, Ok(77));
+    assert_eq!(
+        client.reopen_forum_topic(CHAT, 9).await,
         Err(TelegramError::RateLimited {
             retry_after: Duration::from_secs(3)
         })
     );
+    let chat = client.get_chat(CHAT).await.unwrap();
+    assert!(chat.is_forum && chat.kind == "supergroup");
+    let me = client.get_chat_member(CHAT, bot).await.unwrap();
+    assert!(me.can_manage_topics && me.status == "administrator");
+    let updates = client.get_updates(5, Duration::from_secs(1)).await.unwrap();
+    assert_eq!(updates.len(), 2, "unknown update kinds keep their id");
+    assert_eq!(
+        updates[0].message.as_ref().unwrap().topic_thread_id(),
+        Some(7)
+    );
+    assert_eq!(updates[1].update_id, 6);
+    assert!(updates[1].message.is_none());
 
     let direct = telegram.received_requests().await.unwrap().len();
-    assert_eq!(direct, 5);
+    assert_eq!(direct, 9);
     assert_eq!(proxy.requests(), direct, "all requests went via the proxy");
+}
+
+#[tokio::test]
+async fn plain_text_is_sent_without_parse_mode() {
+    let telegram = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/bot{BOT_TOKEN}/sendMessage")))
+        .respond_with(ok(json!({"message_id": 1})))
+        .mount(&telegram)
+        .await;
+    let proxy = ForwardProxy::start().await;
+    let client = HttpTelegramClient::new(&telegram_config(&telegram.uri(), &proxy.url())).unwrap();
+    client
+        .send_message(CHAT, None, "<b>raw</b>", false)
+        .await
+        .unwrap();
+    let req = &telegram.received_requests().await.unwrap()[0];
+    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+    assert!(body.get("parse_mode").is_none(), "{body}");
+    assert!(body.get("message_thread_id").is_none(), "General: {body}");
+    assert_eq!(body["text"], "<b>raw</b>");
 }
 
 #[derive(Clone, Default)]
@@ -149,7 +218,7 @@ async fn token_is_not_in_errors_or_logs_on_connection_failure() {
     let client =
         HttpTelegramClient::new(&telegram_config("https://api.telegram.org", &proxy)).unwrap();
     let err = client
-        .send_message(CHAT, "secret question text", None)
+        .send_message(CHAT, Some(7), "secret question text", true)
         .await
         .unwrap_err();
     // What callers log: the error display and class.

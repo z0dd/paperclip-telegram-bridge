@@ -14,9 +14,15 @@ pub async fn create<P: PaperclipApi, T: TelegramApi>(
     conv: &Conversation,
 ) -> Result<std::result::Result<i64, TelegramError>> {
     let chat = ctx.cfg.telegram.chat_id;
-    match ctx.telegram.create_forum_topic(chat, &conv.topic_name).await {
+    match ctx
+        .telegram
+        .create_forum_topic(chat, &conv.topic_name)
+        .await
+    {
         Ok(thread_id) => {
-            ctx.store.set_topic(conv.issue_id.clone(), thread_id).await?;
+            ctx.store
+                .set_topic(conv.issue_id.clone(), thread_id)
+                .await?;
             tracing::info!(
                 issue_id = %conv.issue_id,
                 thread_id,
@@ -50,7 +56,12 @@ pub async fn reopen<P: PaperclipApi, T: TelegramApi>(
             Ok(Ok(()))
         }
         Err(e) => {
-            tracing::warn!(issue_id, thread_id, class = e.class(), "reopenForumTopic failed");
+            tracing::warn!(
+                issue_id,
+                thread_id,
+                class = e.class(),
+                "reopenForumTopic failed"
+            );
             Ok(Err(e))
         }
     }

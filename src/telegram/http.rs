@@ -204,7 +204,9 @@ impl TelegramApi for HttpTelegramClient {
 
     async fn get_me(&self) -> Result<i64> {
         let v = self.call("getMe", json!({}), self.request_timeout).await?;
-        v.get("id").and_then(Value::as_i64).ok_or(TelegramError::Decode)
+        v.get("id")
+            .and_then(Value::as_i64)
+            .ok_or(TelegramError::Decode)
     }
 
     async fn get_chat(&self, chat_id: i64) -> Result<ChatInfo> {
@@ -300,7 +302,11 @@ mod tests {
             TelegramError::Conflict
         );
         assert_eq!(
-            classify(403, "Forbidden: bot was kicked from the supergroup chat".into(), None),
+            classify(
+                403,
+                "Forbidden: bot was kicked from the supergroup chat".into(),
+                None
+            ),
             TelegramError::Forbidden
         );
         assert!(classify(502, String::new(), None).is_transient());

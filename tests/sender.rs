@@ -1,136 +1,92 @@
-//! Outgoing Telegram queue: `retry_after` is honoured and pauses the queue,
-//! messages keep their order (architecture §7.3).
+//! The single Telegram queue (ADR-0010 §2.2): calls are spaced by
+//! `TELEGRAM_GROUP_MIN_INTERVAL`, `retry_after` pauses the whole queue and
+//! the order is kept.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+mod support;
+
 use std::time::{Duration, Instant};
 
-use bridge::core::sender::{self, SenderSettings, TgSender};
+use bridge::core::sender::Sender;
+use bridge::core::{Bridge, Ctx};
 use bridge::health::HealthTracker;
-use bridge::retry::Backoff;
-use bridge::telegram::*;
+use bridge::paperclip::HttpPaperclipClient;
+use bridge::store::Store;
+use bridge::telegram::TelegramError;
+use std::sync::Arc;
+use support::harness::{FakeTelegram, Harness};
+use support::paperclip::PaperclipMock;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Default)]
-struct Flaky {
-    rate_limited_once: AtomicU32,
-    transient_left: AtomicU32,
-    sent: Mutex<Vec<(String, Instant)>>,
-}
-
-impl TelegramApi for Flaky {
-    async fn get_updates(&self, _: i64, _: Duration) -> Result<Vec<Update>> {
-        Ok(vec![])
-    }
-    async fn send_message(&self, _: i64, html: &str, _: Option<&ReplyMarkup>) -> Result<i64> {
-        if self.rate_limited_once.swap(0, Ordering::SeqCst) == 1 {
-            return Err(TelegramError::RateLimited {
-                retry_after: Duration::from_secs(1),
-            });
-        }
-        if self.transient_left.load(Ordering::SeqCst) > 0 {
-            self.transient_left.fetch_sub(1, Ordering::SeqCst);
-            return Err(TelegramError::Transient { reason: "connect" });
-        }
-        let mut s = self.sent.lock().unwrap();
-        s.push((html.to_string(), Instant::now()));
-        Ok(s.len() as i64)
-    }
-    async fn edit_message_text(
-        &self,
-        _: i64,
-        _: i64,
-        _: &str,
-        _: Option<&InlineKeyboard>,
-    ) -> Result<()> {
-        Ok(())
-    }
-    async fn edit_reply_markup(&self, _: i64, _: i64, _: Option<&InlineKeyboard>) -> Result<()> {
-        Ok(())
-    }
-    async fn answer_callback_query(&self, _: &str, _: Option<&str>) -> Result<()> {
-        Ok(())
-    }
-    async fn set_my_commands(&self, _: i64, _: &[BotCommand]) -> Result<()> {
-        Ok(())
-    }
-    async fn get_me(&self) -> Result<()> {
-        Ok(())
-    }
-}
-
-fn start(
-    api: Arc<Flaky>,
-    min_interval: Duration,
-    max_attempts: u32,
-) -> (TgSender, CancellationToken) {
-    let (tx, rx) = TgSender::channel();
-    let cancel = CancellationToken::new();
-    tokio::spawn(sender::run(
-        api,
-        rx,
-        SenderSettings {
-            chat_id: 1,
-            min_interval,
-            backoff: Backoff::new(Duration::from_millis(1), Duration::from_millis(10)),
-            max_attempts,
-        },
-        cancel.clone(),
+/// A context whose sender runs as the real task.
+async fn running(
+    interval: &str,
+) -> (
+    Harness,
+    Ctx<HttpPaperclipClient, FakeTelegram>,
+    Arc<FakeTelegram>,
+    CancellationToken,
+) {
+    let pc = PaperclipMock::start().await;
+    let h = Harness::start(&pc, &[("TELEGRAM_GROUP_MIN_INTERVAL", interval)]).await;
+    let cfg = bridge::config::Config::from_env(&bridge::config::Env::new(&h.env)).unwrap();
+    let store = Store::open(&cfg.state_path).unwrap();
+    let keys = HttpPaperclipClient::from_config(&cfg.paperclip)
+        .unwrap()
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+    let tg = Arc::new(FakeTelegram::default());
+    let (ctx, notices) = Bridge::new(
+        Arc::new(cfg),
+        keys,
+        tg.clone(),
+        store,
         Arc::new(HealthTracker::new()),
-    ));
-    (tx, cancel)
+    );
+    let cancel = CancellationToken::new();
+    tokio::spawn(Sender::new(ctx.clone(), notices).run(cancel.clone()));
+    (h, ctx, tg, cancel)
 }
 
-#[tokio::test]
-async fn retry_after_is_honoured_and_order_kept() {
-    let api = Arc::new(Flaky::default());
-    api.rate_limited_once.store(1, Ordering::SeqCst);
-    let (tx, cancel) = start(api.clone(), Duration::ZERO, 3);
+async fn wait_sent(tg: &FakeTelegram, n: usize, limit: Duration) {
     let t0 = Instant::now();
-    let a = tx.clone();
-    let first = tokio::spawn(async move { a.send("first".into(), None).await });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let second = tx.send("second".into(), None).await.unwrap();
-    first.await.unwrap().unwrap();
-    assert_eq!(second, 2);
-    let sent = api.sent.lock().unwrap().clone();
-    assert_eq!(sent[0].0, "first");
-    assert_eq!(sent[1].0, "second");
-    assert!(
-        sent[0].1 - t0 >= Duration::from_secs(1),
-        "waited retry_after"
-    );
-    cancel.cancel();
-}
-
-#[tokio::test]
-async fn messages_are_spaced_by_min_interval() {
-    let api = Arc::new(Flaky::default());
-    let (tx, cancel) = start(api.clone(), Duration::from_millis(300), 3);
-    for n in 0..3 {
-        tx.send(format!("m{n}"), None).await.unwrap();
+    while tg.sent().len() < n {
+        assert!(t0.elapsed() < limit, "only {} of {n} sent", tg.sent().len());
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let sent = api.sent.lock().unwrap().clone();
-    assert!(sent[1].1 - sent[0].1 >= Duration::from_millis(290));
-    assert!(sent[2].1 - sent[1].1 >= Duration::from_millis(290));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn calls_are_spaced_by_the_group_interval() {
+    let (_h, ctx, tg, cancel) = running("300ms").await;
+    let t0 = Instant::now();
+    for i in 0..3 {
+        ctx.notify(None, format!("n{i}"));
+    }
+    wait_sent(&tg, 3, Duration::from_secs(5)).await;
+    assert!(
+        t0.elapsed() >= Duration::from_millis(600),
+        "{:?}",
+        t0.elapsed()
+    );
+    let texts: Vec<String> = tg.sent().into_iter().map(|s| s.text).collect();
+    assert_eq!(texts, ["n0", "n1", "n2"]);
     cancel.cancel();
 }
 
-#[tokio::test]
-async fn transient_errors_are_retried_up_to_the_limit() {
-    let api = Arc::new(Flaky::default());
-    api.transient_left.store(2, Ordering::SeqCst);
-    let (tx, cancel) = start(api.clone(), Duration::ZERO, 3);
-    assert_eq!(tx.send("ok".into(), None).await.unwrap(), 1);
-    api.transient_left.store(5, Ordering::SeqCst);
-    assert!(
-        tx.send("fails".into(), None)
-            .await
-            .unwrap_err()
-            .is_transient()
-    );
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_after_pauses_the_queue() {
+    let (_h, ctx, tg, cancel) = running("1ms").await;
+    // The first call is rate limited: nothing goes out until retry_after.
+    tg.st().send_errors.push_back(TelegramError::RateLimited {
+        retry_after: Duration::from_secs(1),
+    });
+    let t0 = Instant::now();
+    ctx.notify(None, "first");
+    ctx.notify(None, "second");
+    wait_sent(&tg, 2, Duration::from_secs(5)).await;
+    assert!(t0.elapsed() >= Duration::from_secs(1), "{:?}", t0.elapsed());
+    let texts: Vec<String> = tg.sent().into_iter().map(|s| s.text).collect();
+    assert_eq!(texts, ["first", "second"], "order kept after the pause");
     cancel.cancel();
-    // After shutdown the sender refuses new work instead of hanging.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(tx.send("late".into(), None).await.is_err());
 }

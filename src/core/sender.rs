@@ -37,6 +37,8 @@ pub enum Step {
 pub struct Sender<P, T> {
     ctx: Ctx<P, T>,
     notices: mpsc::UnboundedReceiver<Notice>,
+    /// A notice that hit the rate limit: sent first after the pause.
+    held_notice: Option<Notice>,
     pause_until: Option<Instant>,
     /// Consecutive failures of topic creation (backoff for the queue).
     topic_failures: u32,
@@ -49,6 +51,7 @@ impl<P: PaperclipApi, T: TelegramApi> Sender<P, T> {
         Self {
             ctx,
             notices,
+            held_notice: None,
             pause_until: None,
             topic_failures: 0,
             backoff,
@@ -69,7 +72,11 @@ impl<P: PaperclipApi, T: TelegramApi> Sender<P, T> {
             }
             self.pause_until = None;
         }
-        if let Ok(n) = self.notices.try_recv() {
+        if let Some(n) = self
+            .held_notice
+            .take()
+            .or_else(|| self.notices.try_recv().ok())
+        {
             self.send_notice(n).await;
             return Ok(Step::Called);
         }
@@ -99,10 +106,11 @@ impl<P: PaperclipApi, T: TelegramApi> Sender<P, T> {
         let chat = self.ctx.cfg.telegram.chat_id;
         let mut thread = n.thread_id;
         for attempt in 0..2 {
+            let html = &n.html;
             match self
                 .ctx
                 .telegram
-                .send_message(chat, thread, &n.html, true)
+                .send_message(chat, thread, html, true)
                 .await
             {
                 Ok(_) => {
@@ -117,6 +125,10 @@ impl<P: PaperclipApi, T: TelegramApi> Sender<P, T> {
                 }
                 Err(TelegramError::RateLimited { retry_after }) => {
                     self.pause(retry_after + rate_limit_jitter());
+                    self.held_notice = Some(Notice {
+                        thread_id: thread,
+                        html: n.html,
+                    });
                     return;
                 }
                 Err(e) => {
@@ -129,7 +141,9 @@ impl<P: PaperclipApi, T: TelegramApi> Sender<P, T> {
 
     fn topic_failed(&mut self, e: TelegramError) -> Step {
         match e {
-            TelegramError::RateLimited { retry_after } => self.pause(retry_after + rate_limit_jitter()),
+            TelegramError::RateLimited { retry_after } => {
+                self.pause(retry_after + rate_limit_jitter())
+            }
             TelegramError::Forbidden | TelegramError::Auth { .. } => {
                 tracing::error!(
                     class = e.class(),
@@ -167,7 +181,11 @@ impl<P: PaperclipApi, T: TelegramApi> Sender<P, T> {
             ctx.store.chunk_abandon(c.id).await?;
             return Ok(Step::Idle(None));
         };
-        match ctx.telegram.send_message(chat, Some(thread), &text, html).await {
+        match ctx
+            .telegram
+            .send_message(chat, Some(thread), &text, html)
+            .await
+        {
             Ok(message_id) => {
                 if !ctx.health.is_telegram_send_ok() {
                     tracing::info!("telegram accepts messages again");

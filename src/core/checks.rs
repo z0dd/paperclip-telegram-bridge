@@ -86,7 +86,11 @@ pub async fn run<P: PaperclipApi, T: TelegramApi>(ctx: Ctx<P, T>, cancel: Cancel
             }
             Err(CheckError::Unavailable(e)) => {
                 failures += 1;
-                tracing::warn!(class = e.class(), failures, "telegram supergroup check postponed");
+                tracing::warn!(
+                    class = e.class(),
+                    failures,
+                    "telegram supergroup check postponed"
+                );
                 match e {
                     TelegramError::RateLimited { retry_after } => retry_after,
                     _ => backoff.delay(failures),

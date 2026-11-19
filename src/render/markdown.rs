@@ -73,7 +73,9 @@ fn block_line(line: &str) -> String {
         }
     }
     // Horizontal rule.
-    if trimmed.len() >= 3 && (trimmed.bytes().all(|b| b == b'-') || trimmed.bytes().all(|b| b == b'*')) {
+    if trimmed.len() >= 3
+        && (trimmed.bytes().all(|b| b == b'-') || trimmed.bytes().all(|b| b == b'*'))
+    {
         return "──────────".into();
     }
     format!("{}{}", escape(indent), inline(trimmed))
@@ -110,7 +112,13 @@ pub fn inline(s: &str) -> String {
         }
         // Paired markers, longest first.
         let mut matched = false;
-        for (marker, tag) in [("**", "b"), ("__", "b"), ("~~", "s"), ("*", "i"), ("_", "i")] {
+        for (marker, tag) in [
+            ("**", "b"),
+            ("__", "b"),
+            ("~~", "s"),
+            ("*", "i"),
+            ("_", "i"),
+        ] {
             if !starts_with(&chars, i, marker) {
                 continue;
             }
@@ -195,7 +203,10 @@ mod tests {
         assert_eq!(inline("2 * 3 * 4"), "2 * 3 * 4");
         assert_eq!(inline("**open"), "**open");
         assert_eq!(inline("a < b & c"), "a &lt; b &amp; c");
-        assert_eq!(inline("[x](javascript:alert(1))"), "[x](javascript:alert(1))");
+        assert_eq!(
+            inline("[x](javascript:alert(1))"),
+            "[x](javascript:alert(1))"
+        );
         assert_eq!(inline("`"), "`");
     }
 
@@ -223,7 +234,8 @@ mod tests {
         let html = to_html(md);
         for tag in ["b", "i", "a", "code", "pre", "s", "blockquote"] {
             assert_eq!(
-                html.matches(&format!("<{tag}>")).count() + html.matches(&format!("<{tag} ")).count(),
+                html.matches(&format!("<{tag}>")).count()
+                    + html.matches(&format!("<{tag} ")).count(),
                 html.matches(&format!("</{tag}>")).count(),
                 "{tag}: {html}"
             );

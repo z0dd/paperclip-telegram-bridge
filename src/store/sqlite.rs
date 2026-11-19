@@ -389,8 +389,8 @@ pub fn extend_hot(c: &mut Connection, issue_id: &str, hot_until: &str) -> Result
 }
 
 pub fn seen_of(c: &mut Connection, issue_id: &str, ids: &[String]) -> Result<Vec<String>> {
-    let mut stmt = c
-        .prepare_cached("SELECT 1 FROM seen_comments WHERE issue_id = ?1 AND comment_id = ?2")?;
+    let mut stmt =
+        c.prepare_cached("SELECT 1 FROM seen_comments WHERE issue_id = ?1 AND comment_id = ?2")?;
     let mut out = Vec::new();
     for id in ids {
         if stmt.exists(params![issue_id, id])? {

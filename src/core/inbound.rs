@@ -23,7 +23,11 @@ pub fn namespace() -> Uuid {
 /// `UUIDv5(NS_BRIDGE, "tg:<chat_id>:<message_id>")`: a retried message gets the
 /// same id, and Paperclip returns the existing comment (ADR-0010 §1.3).
 pub fn client_request_id(chat_id: i64, message_id: i64) -> String {
-    Uuid::new_v5(&namespace(), format!("tg:{chat_id}:{message_id}").as_bytes()).to_string()
+    Uuid::new_v5(
+        &namespace(),
+        format!("tg:{chat_id}:{message_id}").as_bytes(),
+    )
+    .to_string()
 }
 
 /// What happens with an admitted message.

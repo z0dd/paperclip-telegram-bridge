@@ -53,9 +53,17 @@ fn check_config() -> ExitCode {
             println!(
                 "configuration OK: {} Paperclip key{}, {} allowed Telegram user{}, telegram proxy scheme {}",
                 cfg.paperclip.tokens.len(),
-                if cfg.paperclip.tokens.len() == 1 { "" } else { "s" },
+                if cfg.paperclip.tokens.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
                 cfg.telegram.allowed_user_ids.len(),
-                if cfg.telegram.allowed_user_ids.len() == 1 { "" } else { "s" },
+                if cfg.telegram.allowed_user_ids.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
                 cfg.telegram.proxy.scheme()
             );
             ExitCode::SUCCESS

@@ -279,7 +279,11 @@ fn chats_failed<P: PaperclipApi, T: TelegramApi>(
 
 /// Is this conversation owned by the same Paperclip user as the others?
 /// All keys must belong to one user (ADR-0010 §1.1).
-fn owner_matches<P: PaperclipApi, T: TelegramApi>(ctx: &Ctx<P, T>, chat: &Chat, key: usize) -> bool {
+fn owner_matches<P: PaperclipApi, T: TelegramApi>(
+    ctx: &Ctx<P, T>,
+    chat: &Chat,
+    key: usize,
+) -> bool {
     let Some(user) = chat.user_id.as_deref() else {
         return true;
     };
@@ -338,7 +342,11 @@ async fn sync_company<P: PaperclipApi, T: TelegramApi>(
                 let changed = chat.updated_at.is_some() && chat.updated_at != conv.last_updated_at;
                 if changed {
                     ctx.store
-                        .set_updated_at(conv.issue_id.clone(), chat.updated_at.clone(), ctx.hot_until())
+                        .set_updated_at(
+                            conv.issue_id.clone(),
+                            chat.updated_at.clone(),
+                            ctx.hot_until(),
+                        )
                         .await?;
                 }
                 let due = changed || is_hot(conv) || sweep_due(ctx, conv);

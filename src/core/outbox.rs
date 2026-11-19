@@ -25,7 +25,9 @@ pub async fn run<P: PaperclipApi, T: TelegramApi>(ctx: Ctx<P, T>, cancel: Cancel
             tracing::warn!(error = %e, "pc_outbox pass failed");
         }
         let wait = match ctx.store.next_message_due().await {
-            Ok(Some(at)) => super::until(&at).max(Duration::from_millis(10)).min(IDLE_WAIT),
+            Ok(Some(at)) => super::until(&at)
+                .max(Duration::from_millis(10))
+                .min(IDLE_WAIT),
             _ => IDLE_WAIT,
         };
         let notified = ctx.outbox_notify.notified();
@@ -72,7 +74,9 @@ pub fn classify(e: &PaperclipError) -> Outcome {
         PaperclipError::Conflict { .. } if e.message_contains("paused") => Outcome::Rejected {
             notice: Some(notices::PAUSED.into()),
         },
-        PaperclipError::Conflict { .. } if e.message_contains("already used for different content") => {
+        PaperclipError::Conflict { .. }
+            if e.message_contains("already used for different content") =>
+        {
             Outcome::Rejected { notice: None }
         }
         PaperclipError::Forbidden { .. } => Outcome::Rejected {
@@ -90,9 +94,7 @@ pub fn classify(e: &PaperclipError) -> Outcome {
 async fn process<P: PaperclipApi, T: TelegramApi>(ctx: &Ctx<P, T>, e: PcEntry) -> Result<()> {
     let conv = ctx.store.conversation(e.issue_id.clone()).await?;
     let (Some(body), Some(conv)) = (e.body.clone(), conv) else {
-        ctx.store
-            .message_rejected(e.id, "lost".into())
-            .await?;
+        ctx.store.message_rejected(e.id, "lost".into()).await?;
         return Ok(());
     };
     let key = ctx.key_index(&conv.key_ref);
@@ -124,8 +126,10 @@ async fn process<P: PaperclipApi, T: TelegramApi>(ctx: &Ctx<P, T>, e: PcEntry) -
     let thread = conv.topic_thread_id;
     match classify(&err) {
         Outcome::Rejected { notice } => {
-            if matches!(err, PaperclipError::Forbidden { .. } | PaperclipError::Conflict { .. })
-                && notice.as_deref() != Some(notices::PAUSED)
+            if matches!(
+                err,
+                PaperclipError::Forbidden { .. } | PaperclipError::Conflict { .. }
+            ) && notice.as_deref() != Some(notices::PAUSED)
             {
                 tracing::error!(
                     pc_outbox_id = e.id,
@@ -199,7 +203,9 @@ mod tests {
     #[test]
     fn answers_are_classified_as_in_the_adr_table() {
         assert_eq!(
-            classify(&conflict("Task is paused. Resume it before sending a message.")),
+            classify(&conflict(
+                "Task is paused. Resume it before sending a message."
+            )),
             Outcome::Rejected {
                 notice: Some(notices::PAUSED.into())
             }

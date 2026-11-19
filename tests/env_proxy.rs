@@ -49,7 +49,6 @@ fn env_proxy_variables_are_ignored() {
             SecretString::from("pcp_board_placeholder"),
             Duration::from_secs(2),
             Duration::from_secs(2),
-            Duration::from_secs(2),
         )
         .unwrap();
         client.health().await.unwrap();
