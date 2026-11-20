@@ -4,7 +4,7 @@
 
 **Важно про образ.** Runtime-образ — distroless: в нём **нет shell, `sqlite3`, `tar`, `curl`, `ps`**. Внутри контейнера можно запускать только бинарь `/usr/local/bin/bridge` (`docker compose exec bridge /usr/local/bin/bridge <подкоманда>` или `docker compose run --rm bridge <подкоманда>`). Любые `docker exec … sh`, `… sqlite3` не работают. Работа с файлами состояния — через отдельный контейнер ([BACKUP_RESTORE.md](BACKUP_RESTORE.md)).
 
-Команды ниже не прогонялись на реальном развёртывании (deployment в рамках v1 не выполнялся); поведение бинаря подтверждено кодом и тестами.
+Команды ниже не прогонялись на реальном развёртывании (живой деплой не выполнялся); поведение бинаря подтверждено кодом и тестами.
 
 ## 1. Статус и логи
 
@@ -25,6 +25,7 @@ docker compose exec bridge /usr/local/bin/bridge healthcheck   # "healthy" ил�
 | лог `bridge failed` с `error: cannot open state: … schema version N is newer than supported` | том использовался более новой версией bridge | запустить образ той же или более новой версии; откат версии не поддерживается |
 | `healthcheck`: `health file unreadable` или `health file is stale (Ns old)` | процесс не запущен или завис (файл обновляется раз в 15 с, предел 60 с) | смотреть логи, перезапустить |
 | `unhealthy: Paperclip key rejected (401)` | ключ отозван, истёк или неверный | раздел 3 (ротация); в General приходит «🔑 Paperclip отклонил ключ бриджа (401)». Повтор раз в 5 минут |
+| В логе ERROR `keys belong to different Paperclip users`, `healthcheck` пишет `Paperclip key rejected (401)`, хотя ключи не отзывались | в `PAPERCLIP_TOKEN_FILES` ключи разных пользователей: беседы второго владельца пропускаются, код выставляет `paperclip_auth_ok=false` (`core/discovery.rs: owner_matches`) | оставить ключи одного пользователя и перезапустить; публиковать в чужую беседу Paperclip всё равно не даёт (`403`) |
 | `unhealthy: Agent Chat is disabled in Paperclip` | в Paperclip выключен experimental-флаг Agent Chat (`404 Agent Chat is disabled`) | включить Agent Chat; в General приходит одно сообщение, после включения bridge продолжит сам |
 | `unhealthy: Telegram supergroup check failed …`, в логе ERROR `telegram supergroup check failed` с `reason` | `TELEGRAM_CHAT_ID` не супергруппа, темы выключены, бот не администратор или без права «Управление темами» | исправить настройку группы по `reason`; проверка повторяется раз в 5 минут, рестарт не нужен |
 | `unhealthy: Telegram refuses messages to the supergroup (403)` | бота удалили из группы или лишили прав | вернуть бота администратором; отправка повторяется раз в 5 минут |
@@ -49,15 +50,17 @@ docker compose exec bridge /usr/local/bin/bridge healthcheck   # "healthy" ил�
 
 ## 3. Ротация и отзыв ключей
 
-Board key **бессрочный** (решение пользователя) и даёт полный доступ пользователя. Секреты читаются из файлов только при старте, поэтому после замены файла нужен перезапуск. Ни ключа, ни токена бота нет в состоянии `/state` и в его backup.
+Board key **бессрочный** (решение пользователя) и даёт полный доступ пользователя во всех его компаниях. Ключей может быть несколько (`PAPERCLIP_TOKEN_FILES`, все одного пользователя). Секреты читаются из файлов только при старте, поэтому после замены файла нужен перезапуск. Ни ключа, ни токена бота нет в состоянии `/state` и в его backup: в базе лежит только `key_ref` (номер ключа и 8 hex от `sha256`).
+
+Telegram-аккаунт из `TELEGRAM_ALLOWED_USER_IDS` пишет агентам от имени владельца ключа во всех компаниях, а одобрять действия из Telegram в v2 нельзя (карточек нет). Что может атакующий в каждом случае — [THREAT_MODEL](THREAT_MODEL.md).
 
 ### 3.1. Утечка или подозрение (потерян или взломан Telegram-аккаунт, сервер, backup, лог)
 
-Сначала отзовите board key, любым из способов:
+Сначала отзовите board key (все ключи, если их несколько), любым из способов:
 
 1. В интерфейсе Paperclip (раздел board API keys; точное расположение пунктов меню в репозитории не описано, не проверено).
 2. По API: `DELETE /api/board-api-keys/{keyId}` (`docs/paperclip-api.md` §2).
-3. С сервера, где запущен bridge, тем же ключом из `PAPERCLIP_TOKEN_FILE`:
+3. С сервера, где запущен bridge, тем же ключом:
 
    ```bash
    docker compose run --rm bridge revoke-paperclip-key
@@ -65,29 +68,38 @@ Board key **бессрочный** (решение пользователя) и 
    docker compose exec bridge /usr/local/bin/bridge revoke-paperclip-key
    ```
 
-   Подкоманда вызывает `POST /api/cli-auth/revoke-current`; ей нужны `PAPERCLIP_URL` и `PAPERCLIP_TOKEN_FILE`. Успех — exit 0 и сообщение `Paperclip key revoked…`; при ошибке — exit 1 и подсказка отозвать ключ в UI. Бинарь вызывается по пути `/usr/local/bin/bridge` (пути `/bridge` в образе нет).
+   Подкоманда вызывает `POST /api/cli-auth/revoke-current`. Ей нужны `PAPERCLIP_URL` и `PAPERCLIP_TOKEN_FILE` (читается только эта переменная, `PAPERCLIP_TOKEN_FILES` игнорируется). Успех — exit 0 и сообщение `Paperclip key revoked…`; при ошибке — exit 1 и подсказка отозвать ключ в UI. Бинарь вызывается по пути `/usr/local/bin/bridge` (пути `/bridge` в образе нет).
 
-После отзыва bridge получит 401, пришлёт «🔑 Ключ Paperclip отклонён (401/403)», `healthcheck` станет unhealthy, повторы раз в 5 минут. Это ожидаемо.
+   **Если ключей несколько**, задайте путь к отзываемому ключу явно и повторите для каждого файла (имя файла — пример):
+
+   ```bash
+   docker compose run --rm -e PAPERCLIP_TOKEN_FILE=/run/secrets/pc_company_a bridge revoke-paperclip-key
+   ```
+
+   Эту форму на реальном развёртывании не проверяли: в compose-примере `PAPERCLIP_TOKEN_FILE` задан в `environment`, а с `PAPERCLIP_TOKEN_FILES` вы заменяете его своим файлом секрета.
+
+После отзыва ключ получает `401`. Bridge пишет ERROR `paperclip rejected the board key (401)`, присылает в General одно сообщение «🔑 Paperclip отклонил ключ бриджа (401)…» на каждый отклонённый ключ, `healthcheck` становится unhealthy, повторы идут раз в 5 минут. Беседы компаний отозванного ключа перестают читаться, сообщения из Telegram в них остаются в очереди (`pending`). Это ожидаемо. Пока вы не заменили ключ, остановите контейнер: `docker compose stop bridge`.
 
 ### 3.2. При компрометации Telegram дополнительно
 
 1. В BotFather выполнить `/revoke` для бота: токен бота сразу перестаёт работать, канал к bridge закрыт.
 2. Остановить контейнер: `docker compose stop bridge`.
-3. Проверить в Paperclip activity за период: `issue.thread_interaction_accepted`, `issue.thread_interaction_rejected`, `approval.approved` (`docs/paperclip-api.md` §11) и сверить с логами bridge по `interaction_id`. В логах bridge решения из Telegram помечены сообщениями `decision from telegram queued` (`update_id`, `delivery_id`, `interaction_id`, `kind`, `risk`, `action`), `answer delivered to Paperclip`, `governed decision applied` (`outcome`). По Paperclip UI отличить решение «из Telegram» нельзя, только по этому журналу.
-4. Завершить сессии в Telegram, включить/сменить облачный пароль (2FA).
-5. Выпустить новый ключ и новый токен бота, обновить файлы секретов, запустить (3.3).
+3. Убрать из группы посторонних. Если взломан аккаунт из allowlist, удалить его из `TELEGRAM_ALLOWED_USER_IDS`. Завершить сессии в Telegram, включить или сменить облачный пароль (2FA).
+4. Проверить в Paperclip беседы с агентами за период компрометации: комментарии пользователя, которых вы не писали, и неожиданные `/new` (начало новой сессии агента). Источник комментария (UI или bridge) Paperclip не сохраняет. По логам bridge можно сопоставить время: `message queued for paperclip` (`update_id`, `issue_id`, `thread_id`), `message delivered to paperclip`, `message rejected by paperclip` (`class`). Telegram id автора в лог не пишется, кто из разрешённых пользователей написал, видно только в истории темы в Telegram. Комментарий пользователя снимает карточки с `supersedeOnUserComment`: проверьте, не «просрочены» ли нужные запросы подтверждения, и при необходимости создайте их заново.
+5. Если токен бота утёк, но Paperclip не затронут, отзывать board key не нужно: с токеном бота нельзя писать в Paperclip (`from.id` выставляет Telegram, [THREAT_MODEL](THREAT_MODEL.md)).
+6. Выпустить новый токен бота (и новый ключ, если он отзывался), обновить файлы секретов, запустить (3.3, 3.4).
 
-### 3.3. Плановая ротация (рекомендация: раз в 90 дней, срока у ключа нет)
+### 3.3. Плановая ротация board key (рекомендация: раз в 90 дней, срока у ключа нет)
 
-1. Создать новый board key Paperclip (UI/CLI, `docs/paperclip-api.md` §2).
-2. Заменить файл секрета (`secrets/paperclip_token`): удалить старый, записать новый и выставить владельца и права по рецепту из раздела 3.5. Обычный `chmod 0600`/`0400` у файла хост-пользователя в rootless Docker не подходит.
+1. Создать новый board key Paperclip (UI/CLI, `docs/paperclip-api.md` §2). Ключ должен принадлежать тому же пользователю: ключ другого пользователя bridge не примет (беседы чужого владельца пропускаются, в логе ERROR `keys belong to different Paperclip users`).
+2. Заменить файл секрета (`secrets/paperclip_token` или один из файлов `PAPERCLIP_TOKEN_FILES`): удалить старый, записать новый и выставить владельца и права по рецепту из раздела 3.5. Обычный `chmod 0600`/`0400` у файла хост-пользователя в rootless Docker не подходит.
 3. `docker compose restart bridge` (или `up -d --force-recreate`).
-4. Убедиться: `docker compose exec bridge /usr/local/bin/bridge healthcheck` печатает `healthy`; для проверки ключа дождитесь одного цикла `sync` (15 с по умолчанию) и убедитесь, что нет сообщения об отклонённом ключе.
+4. Убедиться: `docker compose exec bridge /usr/local/bin/bridge healthcheck` печатает `healthy`; подождите один цикл обнаружения (`PAPERCLIP_POLL_INTERVAL`, 5 с) и убедитесь, что в General нет сообщения об отклонённом ключе, а в логе нет ERROR `paperclip rejected the board key`. Темы и беседы остаются прежними: связь хранится по `issue_id` и `topic_thread_id`, а не по ключу. Беседа находит свой ключ по `key_ref`: сначала по хешу, затем по номеру в списке, поэтому и перестановка файлов в `PAPERCLIP_TOKEN_FILES`, и замена содержимого файла на том же месте работают.
 5. Отозвать старый ключ (способы 1–2 из 3.1; `revoke-paperclip-key` после смены файла отозвал бы уже **новый** ключ).
 
 ### 3.4. Ротация токена бота
 
-В BotFather: `/revoke` (выдаёт новый токен) → записать в `secrets/telegram_bot_token` → `docker compose restart bridge`. Состояние (offset) сохраняется.
+В BotFather: `/revoke` (выдаёт новый токен) → записать в `secrets/telegram_bot_token` → `docker compose restart bridge`. Бот остаётся тем же, поэтому его членство и права администратора в супергруппе сохраняются, группу перенастраивать не нужно. Состояние сохраняется: связи «тема ↔ беседа», курсоры комментариев, offset Telegram и очереди. Если вы создали **нового** бота вместо перевыпуска токена, добавьте его в супергруппу администратором с правом «Управление темами» (`can_manage_topics`): при старте это проверяется (`telegram supergroup check failed`), темы остаются прежними.
 
 ### 3.5. Права файлов секретов (rootless Docker)
 
