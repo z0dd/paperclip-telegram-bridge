@@ -1,6 +1,6 @@
 # ADR-0008. Governed-подтверждения из Telegram
 
-- Статус: принято (решение пользователя: Approve/Reject из Telegram разрешены, `GOVERNED_DESTRUCTIVE_MODE=confirm` по умолчанию)
+- Статус: заменено [ADR-0010](0010-v2-forum-bridge.md) (v2.0.0). В v2 карточек и governed-подтверждений в Telegram нет, переменные `GOVERNED_*` игнорируются с WARN. Текст ниже сохранён как история v1. Исходный статус: принято (решение пользователя: Approve/Reject из Telegram разрешены, `GOVERNED_DESTRUCTIVE_MODE=confirm` по умолчанию)
 - Контекст: [docs/paperclip-api.md](../paperclip-api.md) §6.6
 
 ## Контекст

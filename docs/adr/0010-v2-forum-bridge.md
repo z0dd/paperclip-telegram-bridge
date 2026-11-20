@@ -1,8 +1,9 @@
 # ADR-0010. v2: живая беседа с агентами через супергруппу с темами
 
-- Статус: предложено (на приёмке у PET Lead)
+- Статус: принято (реализовано в v2.0.0)
 - Контекст: план v2 (беседа PET-4, план ревизии 10, согласован пользователем), этап 1 — PET-20. Предыдущие решения: [ADR-0002](0002-board-api-key.md), [ADR-0003](0003-sqlite-state.md), [ADR-0004](0004-outbox-exactly-once.md), [ADR-0005](0005-thin-telegram-client.md), [ADR-0006](0006-html-and-callback-data.md), [ADR-0007](0007-healthcheck-heartbeat.md)
-- Заменяет: [ADR-0001](0001-attention-feed-as-source.md), [ADR-0008](0008-governed-from-telegram.md), разделы ADR-0009 про карточки (в v2 карточек нет)
+- Заменяет: [ADR-0001](0001-attention-feed-as-source.md), [ADR-0008](0008-governed-from-telegram.md); частично — [ADR-0004](0004-outbox-exactly-once.md) (reconcile), [ADR-0006](0006-html-and-callback-data.md) (`callback_data`), [ADR-0009](0009-v1.1.0-improvements.md) §1–2 (карточки, draft). Дополняет [ADR-0002](0002-board-api-key.md)
+- Отличия реализации от этого ADR перечислены в [ARCHITECTURE.md](../ARCHITECTURE.md) (пометки «Отличие от ADR-0010»)
 
 ## 0. Как проверялось
 
@@ -117,7 +118,7 @@ curl -s -X POST -H "Authorization: Bearer $PAPERCLIP_BOARD_KEY" -H "Content-Type
 | Ответ агента | `authorType: "agent"`, `authorAgentId` задан, `origin: "comment"`, обычно `createdByRunId` задан | **да** |
 | Квитанция Paperclip | `origin: "fast_response"`, `fastResponseRequestId` задан; в беседе `authorType: "agent"`, `authorAgentId` = агент беседы (`server/src/services/fast-responses.ts:965-976`) | **да** (решение пользователя) |
 | Сообщение пользователя (UI или бридж) | `authorType: "user"`, `authorUserId` задан, `clientRequestId` задан | нет |
-| Системное сообщение | `authorType: "system"`, авторов нет; часто `presentation.kind: "system_notice"` (например, уведомления recovery) | нет (см. открытый вопрос 6.3) |
+| Системное сообщение | `authorType: "system"`, авторов нет; часто `presentation.kind: "system_notice"` (например, уведомления recovery) | нет (см. открытый вопрос 6.3); **в реализации — да, с ⚠️** (решение пользователя в PET-4, см. примечание к 6.3) |
 
 **Правило фильтра:** `deletedAt == null && authorType == "agent" && authorAgentId == conversationAgentId`. Квитанции этим правилом уже покрыты. Квитанцию без агента (`authorUserId: "board-concierge"`, `authorType: "system"`) в беседе получить нельзя: у беседы агент всегда есть.
 
@@ -360,4 +361,6 @@ Mock считает темп отправки, чтобы тест провер�
 - **6.1.** Название темы при переименовании агента: по умолчанию тема **не** переименовывается (`editForumTopic` не вызывается).
 - **6.2.** `/new` (и `/new@<bot>`) из Telegram: по умолчанию отправляется в беседу как `/new`, то есть Paperclip начинает новую сессию агента, как в UI.
 - **6.3.** Системные уведомления (`authorType: "system"`, например о сбое запуска агента): по умолчанию **не** пересылаются, как требует решение «только комментарии агента».
+
+  > **Примечание (v2.0.0): решено иначе.** Пользователь в беседе PET-4 решил пересылать служебные сообщения с пометкой ⚠️. Реализация: `domain/comment.rs: should_forward` пропускает `authorType: "system"`; кроме того, сообщения о сбое или отмене запуска, которые Paperclip публикует от имени агента беседы, распознаются по `GET /api/heartbeat-runs/{runId}` (`domain/comment.rs: is_service_notice`) и тоже получают ⚠️. Правило и проверка на живом API — [paperclip-api.md](../paperclip-api.md) §6.1, поведение — [ARCHITECTURE.md](../ARCHITECTURE.md) §4.3. Отдельный ADR не заводился.
 - **6.4.** Подтверждение доставки сообщения в Paperclip реакцией (`setMessageReaction` 👀/✅): по умолчанию **нет**, чтобы не тратить лимит. Пользователь видит квитанцию агента.
