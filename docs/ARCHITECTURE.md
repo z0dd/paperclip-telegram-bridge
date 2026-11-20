@@ -1,158 +1,228 @@
 # Архитектура
 
-Документ описывает реализованное поведение и составлен по коду ветки `pet-12-improvements`, версия 1.1.0 (`src/`, `Dockerfile`, `deploy/`). Решения и их обоснование — в [docs/adr/](adr/), контракт Paperclip API — в [paperclip-api.md](paperclip-api.md). Номера строк относятся к коммиту, на котором написан документ; при сомнении ищите по имени функции.
+Документ описывает реализованное поведение версии 2.0.0 и составлен по коду `main` на коммите `194eae5` (`src/`, `Dockerfile`, `deploy/`). Решения и их обоснование — в [ADR-0010](adr/0010-v2-forum-bridge.md) и остальных [ADR](adr/), контракт Paperclip API — в [paperclip-api.md](paperclip-api.md). Ссылки на код даны как «файл: функция», без номеров строк. Версия v1 (карточки, governed, формы) описана в истории git, тег `v1.1.0`.
 
-Доработки v1.1.0 (текстовые ответы как в чате, проверка версии Paperclip, host-network deployment, права secret-файлов) спроектированы в [ADR-0009](adr/0009-v1.1.0-improvements.md) и описаны ниже: маршрутизация текста — §4 «Telegram → Paperclip» и «Текст как чат», миграция draft — §3 и §4, проверка версии — §4 «Старт». Вариант с `network_mode: host` — `deploy/compose.host-network.example.yml`: схема выше относится к изолированному примеру, различия — в [THREAT_MODEL](THREAT_MODEL.md) и [RUNBOOK](RUNBOOK.md) §6.
+Если код расходится с ADR-0010, здесь описан код, а отличие отмечено пометкой «Отличие от ADR-0010».
 
 ## 1. Схема
 
 ```
-                    приватная сеть                         сеть с выходом только на proxy
-  ┌─────────────┐   (без proxy)    ┌─────────────────────────────────┐  SOCKS5/HTTP   ┌───────┐   TLS    ┌──────────────────┐
-  │  Paperclip  │ ◄─────────────── │        bridge (один процесс)    │ ─────────────► │ proxy │ ───────► │ api.telegram.org │
-  │ /api/...    │  только исходящие│  poller  sync  runs  outbox     │  только        │(Xray) │  сквозь  │   Bot API        │
-  └─────────────┘                  │  health_writer   sender         │  исходящие     └───────┘  туннель └──────────────────┘
-                                   │         │                       │
-                                   │   SQLite WAL (/state)           │
-                                   └─────────────────────────────────┘
+                 приватная сеть (без proxy)                                     только исходящие, через proxy
+ ┌─────────────┐  GET companies, agents, chats,  ┌───────────────────────────────────────┐  SOCKS5/HTTP  ┌───────┐  TLS сквозь  ┌──────────────────┐
+ │  Paperclip  │  comments, heartbeat-runs/{id}  │        bridge (один процесс)          │ ────────────► │ proxy │ ───────────► │ api.telegram.org │
+ │  /api/...   │ ◄────────────────────────────── │ discovery+outbound  sender+topics     │               │(Xray) │   туннель    │    Bot API       │
+ └─────────────┘  POST issues/{id}/comments      │ poller+inbound  pc_outbox  checks     │               └───────┘              └──────────────────┘
+                                                 │ health_writer     SQLite WAL (/state) │                                               │
+                                                 └───────────────────────────────────────┘                                               ▼
+                                                                         приватная супергруппа с темами: «PET · PET Lead», «NN · Lead», …
 ```
 
-- Входящих портов нет: в `Dockerfile` нет `EXPOSE`, ни в одном compose-примере нет `ports:`.
-- Клиент Paperclip строится с `.no_proxy()` (`src/paperclip/http.rs`), клиент Telegram всегда с `Proxy::all(TELEGRAM_PROXY_URL)` (`src/telegram/http.rs`). Переменные `HTTP(S)_PROXY`/`ALL_PROXY` из окружения не читаются (`tests/env_proxy.rs`).
-- TLS до `api.telegram.org` устанавливается клиентом bridge сквозь соединение с proxy (rustls, провайдер `ring`); proxy TLS не терминирует. Само соединение bridge → proxy при схемах `socks5`/`socks5h`/`http` не шифруется, шифрование там зависит от выбранной схемы и сети. Транспорт до Paperclip определяется схемой `PAPERCLIP_URL` (`http://` или `https://`).
+- Одна супергруппа с включёнными темами (`TELEGRAM_CHAT_ID`) обслуживает все компании, которые видят board-ключи. Одна беседа Agent Chat соответствует одной теме «`<issuePrefix>` · `<имя агента>`» (`render: topic_name`, обрезка до 128 символов).
+- Входящих портов нет: в `Dockerfile` нет `EXPOSE`, в compose-примерах нет `ports:`.
+- Клиент Paperclip строится с `.no_proxy()` (`paperclip/http.rs: HttpPaperclipClient::new`), по одному клиенту на ключ. Клиент Telegram всегда строится с `Proxy::all(TELEGRAM_PROXY_URL)` (`telegram/http.rs`), другого конструктора нет. Переменные `HTTP(S)_PROXY`/`ALL_PROXY` из окружения не читаются (`tests/env_proxy.rs`).
+- TLS до `api.telegram.org` устанавливает сам bridge сквозь соединение с proxy (rustls, провайдер `ring`), proxy TLS не терминирует. Соединение bridge → proxy при схемах `socks5`/`socks5h`/`http` не шифруется. Транспорт до Paperclip определяется схемой `PAPERCLIP_URL`.
 
-## 2. Задачи сервиса
+## 2. Задачи и модули
 
-Процесс (`src/main.rs`, `src/app.rs`) запускает tokio-задачи:
+Процесс (`main.rs`, `app.rs: run`) запускает tokio-задачи:
 
 | Задача | Файл | Что делает |
 |---|---|---|
-| `poller` | `core/poller.rs` | long polling `getUpdates` (`allowed_updates: message, callback_query`); каждый update обрабатывается по очереди через `dialog::handle_update` |
-| `sync` | `core/sync.rs` | раз в `PAPERCLIP_POLL_INTERVAL` читает ленту `attention` каждой компании, находит новые карточки, доставляет их в Telegram, закрывает карточки, решённые в другом месте, дочитывает результат governed-действий |
-| `runs` | `core/runs.rs` | раз в `PAPERCLIP_RUNS_POLL_INTERVAL` читает `heartbeat-runs`, сообщает о сбоях; при `NOTIFY_TASK_COMPLETED=true` — о завершённых задачах |
-| `outbox` | `core/outbox.rs` | отправляет в Paperclip ответы пользователя из очереди |
-| `health_writer` | `app.rs` | раз в 15 с пишет `HEALTH_FILE` |
-| sender | `core/sender.rs` | единая очередь исходящих сообщений Telegram: не чаще 1 сообщения в секунду (`MESSAGE_INTERVAL`), ретраи, уважает `retry_after` |
+| `discovery` (с `outbound`) | `core/discovery.rs`, `core/outbound.rs` | цикл раз в `PAPERCLIP_POLL_INTERVAL` (5 с). Раз в `PAPERCLIP_DISCOVERY_INTERVAL` (60 с) обновляет список компаний каждого ключа и имена агентов. В каждом цикле запрашивает `/chats` каждой компании, регистрирует новые беседы, отмечает пропавшие и читает комментарии тех бесед, которым пора (§4.3). Бэкофф отдельный для каждой компании |
+| `sender` (с `topics`) | `core/sender.rs`, `core/topics.rs` | единственная очередь вызовов Telegram, которые меняют чат: сообщения bridge, `createForumTopic`, `reopenForumTopic`, куски ответов из `tg_outbox`. Не чаще одного вызова в `TELEGRAM_GROUP_MIN_INTERVAL` (3 с, то есть 20 в минуту на группу). `retry_after` ставит на паузу всю очередь |
+| `poller` (с `inbound`) | `core/poller.rs`, `core/inbound.rs` | long polling `getUpdates` (`allowed_updates: ["message"]`). Обновления обрабатываются по одному, по порядку `update_id`. Подходящее сообщение попадает в `pc_outbox` в одной транзакции со сдвигом offset |
+| `pc_outbox` | `core/outbox.rs` | публикует сообщения пользователя: `POST /api/issues/{id}/comments` с детерминированным `clientRequestId` |
+| `checks` | `core/checks.rs` | проверка супергруппы при старте (§4.1). Работает, пока проверка не пройдёт, затем завершается |
+| `health_writer` | `app.rs: health_writer` | раз в 15 с пишет `HEALTH_FILE`, обновляет `queue_depth`, пишет WARN при очереди больше 60 |
 
-Запросы `GET /companies/{id}/live-runs` выполняются только при команде `/status` (`core/commands.rs`), в фоне их никто не опрашивает. Полный перечень вызовов Paperclip: [PAPERCLIP_PERMISSIONS.md](PAPERCLIP_PERMISSIONS.md).
+Модули: `config` (переменные окружения, секреты из файлов), `domain` (компания, беседа, комментарий; правило пересылки `domain/comment.rs: should_forward` и распознавание служебных сообщений), `paperclip` (HTTP-клиент; `dto.rs` — единственное место, которое знает JSON Paperclip; `version.rs` — проверка версии), `telegram` (тонкий клиент Bot API, классификация ошибок тем), `render` (Markdown → Telegram HTML в `render/markdown.rs`, нарезка в `render/text.rs`, названия тем, тексты сообщений bridge), `core` (логика), `store` (SQLite), `health`, `retry`, `fault` (точки отказа для тестов, только с feature `fault-injection`), `logging`, `shutdown`.
 
-Модули: `config` (переменные окружения), `domain` (типы карточек, черновиков), `paperclip` (DTO и HTTP-клиент), `telegram` (тонкий клиент Bot API), `render` (карточки в HTML, `callback_data`), `core` (логика), `store` (SQLite), `health`, `retry`, `fault` (точки отказа для тестов, активны только с feature `fault-injection`), `logging`, `shutdown`.
+Все вызовы Paperclip перечислены в [PAPERCLIP_PERMISSIONS.md](PAPERCLIP_PERMISSIONS.md).
 
 ## 3. Состояние в SQLite
 
-`src/store/sqlite.rs`. Файл `STATE_PATH`, режим `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON`, `busy_timeout=5000`, `temp_store=MEMORY` (корневая ФС контейнера read-only, пишется только `/state`). При старте выполняются `PRAGMA integrity_check` (не `ok` → отказ старта без автопочинки) и миграции по `PRAGMA user_version` (версия БД новее поддерживаемой → отказ). Одно соединение живёт в выделенном потоке, каждая операция `Store` — одна транзакция. При остановке выполняется `PRAGMA wal_checkpoint(TRUNCATE)`.
+`store/sqlite.rs`. Файл `STATE_PATH` (по умолчанию `/state/bridge.db`). Режимы: `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON`, `busy_timeout=5000`, `temp_store=MEMORY` (корневая ФС контейнера read-only, запись возможна только в `/state`). При открытии выполняется `PRAGMA integrity_check`: если результат не `ok`, старт отклоняется без автопочинки. Миграции идут по `PRAGMA user_version`: если версия БД новее поддерживаемой, старт тоже отклоняется. Одно соединение живёт в выделенном потоке, каждая операция `Store` — одна транзакция. При остановке выполняется `PRAGMA wal_checkpoint(TRUNCATE)`.
 
-Таблицы (миграция 1, `sqlite.rs:16-70`):
+**Миграция 2** (v1 → v2) удаляет таблицы v1 (`deliveries`, `delivery_messages`, `drafts`, `outbox`, `seen_runs`, `seen_done_issues`) и ключи `meta` `runs_baseline_at`, `done_baseline_at`, `self_user_id`, затем создаёт таблицы v2. Из v1 сохраняется только `meta.telegram_offset`. Откат на v1 после миграции возможен только из резервной копии ([BACKUP_RESTORE](BACKUP_RESTORE.md)).
 
 | Таблица | Назначение | Ключевые поля |
 |---|---|---|
-| `meta` | служебные значения | `key`/`value`: `telegram_offset`, `runs_baseline_at`, `done_baseline_at`, `started_at`, `self_user_id` (`store/mod.rs:220-226`) |
-| `deliveries` | карточка Paperclip ↔ сообщение Telegram | `interaction_id` UNIQUE, `company_id`, `issue_id`, `issue_ref`, `kind`, `snapshot_json`, `status`, `gen` (поколение клавиатуры), `closed_reason`, `follow_until` |
-| `delivery_messages` | куски сообщения карточки | `(delivery_id, chunk)`, `message_id` |
-| `drafts` | черновики форм и ожидание текста. Для однотекстовых карточек (см. «Текст как чат») draft не создаётся | `delivery_id`, `step`, `answers_json`, `awaiting`, `prompt_message_id` |
-| `outbox` | очередь ответов в Paperclip | `delivery_id` UNIQUE, `action`, `body_json`, `status`, `attempts`, `next_attempt_at`, `last_error` |
-| `seen_runs`, `seen_done_issues` | уже показанные сбои runs и завершённые задачи | хранятся 14 дней (`runs.rs: SEEN_RETENTION`) |
+| `meta` | служебные значения | `telegram_offset`, `started_at` |
+| `companies` | обнаруженные компании | `company_id` PK, `name`, `issue_prefix`, `key_ref`, `last_seen_at` |
+| `conversations` | беседа ↔ тема | `issue_id` PK, `company_id`, `identifier`, `agent_id`, `agent_name`, `key_ref`, `discovered_at`, `watermark_comment_id`, `cursor_comment_id`, `last_updated_at`, `hot_until`, `last_swept_at`, `topic_thread_id` UNIQUE (NULL, пока темы нет), `topic_name`, `topic_state` (`pending`, `active`, `recreating`), `removed_at` |
+| `seen_comments` | дедупликация курсора | `(issue_id, comment_id)` PK, `created_at`. Раз в час удаляются записи старше 7 дней, при этом последние 500 на беседу сохраняются (`discovery.rs: SEEN_RETENTION`, `SEEN_KEEP`) |
+| `tg_outbox` | куски ответов для Telegram | `id`, `issue_id`, `comment_id`, `chunk`, `chunks`, `html`, `plain`, `use_plain`, `status` (`pending`, `sent`, `abandoned`), `attempts`, `next_attempt_at`, `telegram_message_id`; UNIQUE `(comment_id, chunk)` |
+| `pc_outbox` | сообщения пользователя для Paperclip | `id`, `chat_id`, `message_id`, `update_id`, `issue_id`, `client_request_id`, `body`, `status` (`pending`, `in_flight`, `done`, `rejected`), `attempts`, `next_attempt_at`, `last_error` (класс ошибки), `comment_id`, `notified`; UNIQUE `(chat_id, message_id)` |
 
-Статусы `deliveries.status`: `new`, `sending`, `sent`, `answering`, `answered`, `following`, `closed`, `unsupported`. Статусы `outbox.status`: `pending`, `in_flight`, `done`, `abandoned`. В БД **нет** токенов и ключей. В `body_json` лежит ответ пользователя; после завершения записи он обнуляется (`sqlite.rs:595-598`), но `snapshot_json` содержит текст карточки (вопросы агентов), поэтому файл состояния нужно защищать как конфиденциальный.
+- `key_ref` = `<номер ключа>:<первые 8 hex sha256(ключ)>` (`core/mod.rs: key_ref`). Сам ключ в БД не хранится. По `key_ref` беседа находит свой ключ и после перестановки файлов в `PAPERCLIP_TOKEN_FILES` (`Bridge::key_index`: сначала по хешу, затем по номеру).
+- `thread_id` в `tg_outbox` не хранится: он берётся из `conversations` в момент отправки. Поэтому после пересоздания темы очередь уходит в новую тему.
+- Тексты удаляются, как только они больше не нужны. В `tg_outbox` поля `html` и `plain` обнуляются при `sent` и `abandoned`. В `pc_outbox` поле `body` обнуляется при `done` и `rejected`. Пока запись в очереди, в файле лежит текст переписки. Кроме того, в файле хранятся названия компаний, имена агентов, идентификаторы бесед и тем. Поэтому `bridge.db` и его резервные копии нужно защищать как конфиденциальные. Токенов и ключей в БД нет.
+
+> **Отличие от ADR-0010 §2.4.** Схема допускает значения `tg_outbox.status = 'sending'` и `topic_state = 'closed'`, а в `companies` есть поле `unavailable_since`, но код их не записывает. Кусок остаётся `pending` до коммита `sent`. Закрытая тема обнаруживается при отправке (`TOPIC_CLOSED`) и сразу переоткрывается. Недоступность компании хранится в памяти до следующего цикла обнаружения. `recover()` при старте возвращает `sending → pending`, но таких записей не бывает. Поля `plain` и `use_plain` добавлены для fallback в простой текст (§4.4).
 
 ## 4. Потоки данных
 
-### Старт (`src/app.rs: run`)
+### 4.1. Старт (`app.rs: run`)
 
-Порядок: открытие состояния и `recover()` (записи outbox `in_flight` возвращаются в `pending`) → **миграция draft** `Store::reset_chat_text_drafts()` (см. ниже) → создание клиентов → `GET /api/health` и **проверка версии** `paperclip::version::log_check` → запуск задач. Затем в фоне `startup_messages`: `setMyCommands`, уведомления о сброшенных draft, `announce_restart` (незавершённые формы).
+1. Переменные v1 проверяются до всего остального (`config.rs: REMOVED_VARS`, `IGNORED_VARS`). Если задана `PAPERCLIP_COMPANY_IDS` или `TELEGRAM_USER_ID`, старт отклоняется с подсказкой о миграции (код выхода 2). Переменные `GOVERNED_*`, `NOTIFY_*`, `PAPERCLIP_RUNS_POLL_INTERVAL`, `PAPERCLIP_GOVERNED_TIMEOUT` дают только WARN. Одновременно заданные `PAPERCLIP_TOKEN_FILE` и `PAPERCLIP_TOKEN_FILES`, а также один файл, указанный дважды, — ошибка конфигурации. `TELEGRAM_CHAT_ID` должен быть отрицательным (id супергруппы).
+2. Открытие состояния: `integrity_check`, миграции, `recover()` (`pc_outbox` `in_flight → pending`).
+3. Клиенты Paperclip (по одному на ключ) и Telegram.
+4. `GET /api/health` первым ключом и проверка версии (`paperclip/version.rs: log_check`, ADR-0009 §3). Совпадение с `TESTED_PAPERCLIP_VERSION` (`2026.1106.0`) даёт INFO. Другая версия, отсутствие версии или непонятный формат дают WARN. Если `/api/health` не ответил, пишется WARN `paperclip health check failed, continuing`. Старт не блокируется ни в одном случае, повторной проверки нет.
+5. Запуск задач (§2). Задача `checks` проверяет супергруппу: `getMe`, затем `getChat(TELEGRAM_CHAT_ID)` (`type == "supergroup"`, `is_forum == true`), затем `getChatMember(TELEGRAM_CHAT_ID, <id бота>)` (`status == "administrator"`, `can_manage_topics == true`). Нарушение — ERROR с причиной, `telegram_group_ok=false` (unhealthy) и повтор раз в 5 минут, процесс не падает. Сетевые ошибки дают повтор с backoff. После успешной проверки задача завершается. Если права отберут позже, это обнаружит `sender` по `403` (§4.4).
 
-**Проверка версии** (`src/paperclip/version.rs`, ADR-0009 §3). Единственное место с проверенной версией — константа `TESTED_PAPERCLIP_VERSION` (`2026.1106.0`). `classify` относит `version` из `/api/health` к одному из случаев: `Tested` (точное совпадение после `trim`) → INFO `paperclip reachable` с `version_status="tested"`; `Other` (формат `YYYY.MMDD.N`, но другое значение) → WARN «paperclip version differs from the tested one» с `paperclip_version` и `tested_version`; `Missing` (поля нет или пусто) → WARN «paperclip version is missing»; `Unrecognized` (не формат `YYYY.MMDD.N`) → WARN «paperclip version is not recognized». Значение от сервера в логе обрезается до 64 символов. Если `/api/health` не ответил, пишется прежний WARN `paperclip health check failed, continuing`, версия не проверяется. Запуск не блокируется ни в одном случае.
+### 4.2. Обнаружение компаний и бесед (`core/discovery.rs`)
 
-**Миграция draft** (ADR-0009 §2). В v1.0.0 для однотекстовой карточки создавался draft с preview и подтверждением; в v1.1.0 их нет. При каждом старте в одной транзакции удаляются draft карточек, у которых в snapshot ровно один вопрос с `mode == text`, независимо от статуса доставки, и `deliveries.gen` увеличивается на 1 (старые кнопки дают «Устарело»). В outbox ничего не пишется, текст draft не читается и **не отправляется**. Draft других карточек (форма из нескольких вопросов, Reject, вердикты) не трогаются. Для карточек в статусе `sent` `announce_chat_text_reset` перерисовывает карточку и шлёт сообщение «черновик сброшен, текст не отправлен»; ошибка перерисовки пишется в WARN и старт не останавливает. Повторный старт ничего не меняет: новый код такие draft не создаёт, отдельного флага в `meta` нет. Версия схемы БД не менялась. Тесты: `tests/draft_migration.rs`.
+- **Компании.** Раз в `PAPERCLIP_DISCOVERY_INTERVAL` каждый ключ вызывает `GET /api/companies?scope=accessible`. Архивные компании (`status: "archived"`) отбрасываются. Списки ключей объединяются по `id`, и компанию обслуживает первый ключ в порядке конфигурации. Если список одного ключа недоступен, компании, которые этот ключ видел раньше, сохраняются. Затем для каждой компании вызывается `GET /api/companies/{id}/agents`, имена агентов хранятся в памяти. Отметка `last_discovery_ok_at` обновляется, только если все вызовы цикла успешны.
+- **Беседы.** В каждом цикле по каждой доступной компании вызывается `GET /api/companies/{id}/chats`. В ответе — беседы владельца ключа, у которых задан `conversationAgentId`.
+  - **Новая беседа.** Сначала читается водяной знак `GET …/comments?order=desc&limit=1`. Его `id` становится и `watermark_comment_id`, и `cursor_comment_id`, поэтому история до обнаружения не пересылается. Если водяной знак прочитать не удалось, беседа откладывается до следующего цикла. Затем в `conversations` вставляется строка с `topic_state = pending`, и `sender` получает сигнал создать тему.
+  - **Беседы нет в списке:** `removed_at` = сейчас. Тема отвязывается: сообщения в неё получают подсказку (§4.5).
+  - **Беседа вернулась в список:** `removed_at` = NULL. Если темы нет, `sender` создаёт её.
+- **Ключи разных пользователей.** Первый увиденный `conversationUserId` запоминается как владелец (`discovery.rs: owner_matches`). Беседа с другим владельцем пропускается, и в каждом цикле в лог пишется ERROR `keys belong to different Paperclip users`. Публиковать в чужую беседу ключ всё равно не смог бы: Paperclip ответил бы `403 Only the conversation owner…`.
 
-### Paperclip → Telegram (`sync::cycle`)
+  > **Отличие от ADR-0010 §1.1.** По ADR старт отклоняется, а в коде он не отклоняется. Владельца можно узнать только из `/chats`, то есть уже после старта.
+- **Ошибки `/chats`** (`discovery.rs: chats_failed`):
+  - `404 "Agent Chat is disabled"` — одно сообщение в General, `agent_chat_ok=false`, повтор через `PAPERCLIP_DISCOVERY_INTERVAL`;
+  - `401` — ключ отклонён (§4.6);
+  - другой `403` или `404` — компания пропускается до следующего обнаружения;
+  - `429`, `5xx`, сеть — бэкофф этой компании с учётом `Retry-After`; остальные компании опрашиваются как обычно.
 
-1. Повторная доставка карточек в статусах `new`/`sending` (Telegram был недоступен или процесс упал) — `sync.rs:111-120`.
-2. Для каждой компании читается лента `attention` (до 10 страниц по 100, при `400` на курсоре — один перезапуск с первой страницы, `http.rs`).
-3. Для задач с новыми или изменившимися элементами ленты читается `GET /issues/{id}/interactions`; берутся pending-карточки, которых ещё нет в `deliveries` (карточки вне ленты берутся только если адресат не другой пользователь/агент, `sync.rs:317-326`).
-4. Новая карточка записывается в `deliveries` (`new`) и отправляется: `cards::deliver` ставит `sending`, шлёт все куски, затем в одной транзакции `mark_sent` (`core/cards.rs:14-56`).
-5. Открытые карточки, выпавшие из ленты, перечитываются: если решены в другом месте — запись закрывается, сообщение обновляется (при `NOTIFY_RESOLVED_ELSEWHERE=true`).
-6. При 3 подряд неудачах `sync` отправляет «Paperclip недоступен с ЧЧ:ММ», при 401/403 — «Ключ Paperclip отклонён», после успеха — «Связь восстановлена» (`sync.rs:57-105`).
+### 4.3. Paperclip → Telegram (`core/outbound.rs`, `core/sender.rs`)
 
-### Telegram → Paperclip
+1. **Когда читать комментарии.** Комментарии беседы читаются в том же цикле `discovery`, если выполнено хотя бы одно условие:
+   - `updatedAt` беседы изменился;
+   - беседа «горячая» (`hot_until > now`). Окно `CONVERSATION_HOT_WINDOW` (10 мин) открывается при изменении `updatedAt`, при пересылке ответа агента и при доставке сообщения из Telegram. Окно нужно, потому что квитанции Paperclip не меняют `updatedAt`;
+   - с последнего чтения прошло `PAPERCLIP_SWEEP_INTERVAL` (60 с) — страховочный обход.
+2. **Чтение.** `GET /api/issues/{id}/comments?order=asc&after=<cursor>&limit=100`, страница за страницей, пока страница полная, но не больше 20 страниц за проход. Paperclip возвращает и сам якорь курсора (ADR-0010 §1.4), поэтому уже виденные `id` отбрасываются по `seen_comments`.
+   - **Якорь пропал.** Первая страница пустая, хотя `updatedAt` сдвинулся (якорь удалён). Тогда читается `?order=desc&limit=100`, новыми считаются комментарии новее первого уже виденного, а курсор переставляется на самый новый. Ситуация логируется как WARN (`outbound.rs: fallback`).
+3. **Фильтр** (`domain/comment.rs: should_forward`) — единственное место, где решается, что уходит в тему:
+   - удалённые комментарии (`deletedAt`) не пересылаются;
+   - `authorType: "agent"` пересылается, если `authorAgentId` совпадает с агентом беседы. Квитанции Paperclip (`origin: "fast_response"`) тоже пересылаются: они пишутся от имени агента беседы;
+   - `authorType: "system"` пересылается с пометкой ⚠️;
+   - `authorType: "user"` (сообщения из UI и из bridge) и остальные не пересылаются. Благодаря этому эхо невозможно: собственные комментарии bridge имеют `authorType: "user"`.
 
-1. `poller` получает update. `allowlist::check` пропускает только владельца в своём private-чате; чужое — `advance_offset` без ответа и без побочных эффектов (`dialog.rs:140-145`).
-2. Нажатие кнопки или текст превращаются в `Effects` (маршрутизация текста — ниже); `commit_update` в **одной транзакции** применяет операции (черновик, постановка в outbox) и записывает `telegram_offset = update_id + 1` (`dialog.rs:161`, `sqlite.rs:148-170`). `update_id` меньше сохранённого offset считается дублем и пропускается.
-3. Затем идут побочные эффекты (ответ на callback, обновление сообщения); их сбой не критичен, состояние уже согласовано.
-4. `outbox` отправляет ответ (см. раздел 5) и закрывает карточку.
+   > **Отличие от ADR-0010 §6.3.** По ADR системные уведомления по умолчанию не пересылаются. Код пересылает их с ⚠️: это решение пользователя в беседе PET-4.
+4. **Служебные сообщения с ⚠️** (`outbound.rs: is_notice`, правило — `domain/comment.rs: is_service_notice`, контракт — [paperclip-api.md](paperclip-api.md) §6.1). Сообщение о сбое или отмене запуска Paperclip публикует от имени агента беседы, и по полям комментария его не отличить от ответа. Поэтому для пересылаемого комментария агента, у которого есть `createdByRunId`, который не является квитанцией и состоит из одной строки длиной до 300 символов, читается `GET /api/heartbeat-runs/{runId}`. Пометка ⚠️ ставится, если `status` запуска — `failed`, `cancelled` или `timed_out`, а текст комментария совпадает с первой строкой `error` запуска или с `status` (без учёта регистра). Bridge берёт из ответа только `status` и `error` (`paperclip/dto.rs: run`). `error` используется только для сравнения: в тему не отправляется и в лог не пишется. `stderr` и другие поля запуска не читаются. В тему уходит только текст самого комментария, который Paperclip опубликовал в беседе. Если запуск прочитать не удалось (`403`, `404`, сеть), комментарий уходит как обычный ответ без ⚠️, в лог пишется DEBUG с классом ошибки.
+5. **Нарезка** (`render: comment_chunks`). Markdown разбивается на куски до 3500 единиц UTF-16. Блок кода, разрезанный границей куска, закрывается и открывается заново. Каждый кусок превращается в Telegram HTML. Текст из Paperclip экранируется, теги ставит только рендер. Кусков не больше `MAX_MESSAGE_CHUNKS` (3). Если кусков больше, последний заканчивается фразой «… сообщение обрезано, полностью — в Paperclip» и ссылкой на задачу, если задан `PAPERCLIP_UI_URL`. Для каждого куска хранится и простой текст для fallback.
+6. **Коммит.** В одной транзакции (`store: commit_comments`): куски в `tg_outbox` (UNIQUE `(comment_id, chunk)` защищает от повтора), все прочитанные `id` в `seen_comments` (включая непересланные), новый `cursor_comment_id` и `last_swept_at`. Если что-то переслано, продлевается `hot_until`.
+7. **Создание темы** (`topics: create`). `sender` берёт беседы с `topic_state` `pending` или `recreating` в порядке обнаружения и вызывает `createForumTopic("<issuePrefix> · <agent_name>")`. Темы создаются через ту же очередь и с тем же лимитом, поэтому при первом запуске с 28 беседами создание тем займёт около полутора минут.
+8. **Отправка** (`sender: send_chunk`). Порядок шагов: сначала сообщение bridge, затем тема, затем кусок. Куски идут в порядке постановки (`tg_outbox.id`). Внутри беседы следующий кусок не уходит, пока не ушёл предыдущий. `sendMessage` вызывается с `message_thread_id`, `parse_mode=HTML` и выключенным превью ссылок. Ошибки:
+   - `message thread not found` / `TOPIC_DELETED` → `topic_state = recreating`, тема создаётся заново, кусок уходит в новую тему;
+   - `TOPIC_CLOSED` → `reopenForumTopic`, повтор. Если тема при этом оказалась удалённой, она пересоздаётся;
+   - `can't parse entities` → тот же кусок уходит простым текстом без `parse_mode` (`use_plain`);
+   - `429` → вся очередь на паузе на `retry_after` с джиттером;
+   - `403` или `401` → ERROR, `telegram_send_ok=false` (unhealthy), пауза очереди на 5 минут;
+   - прочие ошибки: временные повторяются с backoff, постоянные — до `RETRY_MAX_ATTEMPTS` попыток, затем кусок получает статус `abandoned`.
 
-### Текст как чат (`dialog::on_message`, `forms::chat_text_answer`)
+   Тексты ошибок тем вживую не проверены, классификатор работает по подстрокам ([paperclip-api.md](paperclip-api.md) §8).
+9. **Сообщения bridge** (подсказки, «ключ отклонён», «беседа на паузе» и т. п., `render: notices`) хранятся только в памяти, это best effort. Если тема удалена или закрыта, сообщение уходит в General.
 
-«Подходящая» карточка (`forms::is_chat_text_question`): статус `sent`, тело `ask_user_questions` из одного вопроса с `answerMode: text`. Для неё рендер не добавляет кнопок, а только подсказку «ответьте обычным сообщением» (`render/forms.rs`); любое нажатие кнопки со старой клавиатуры даёт «Устарело». Порядок разбора текстового сообщения после allowlist, нетекстовых вложений и команд, первое совпадение выигрывает:
+Переименование агента тему не переименовывает (ADR-0010 §6.1).
 
-1. reply на prompt ожидающего сценария → текст в этот сценарий (как в v1);
-2. reply на карточку: подходящая → `chat_text_answer`; другая → прежний путь (`on_text`); не в `sent` → «уже закрыта или ответ отправлен»;
-3. reply на что-то иное считается сообщением без reply;
-4. draft, ожидающий текст (причина Reject, вердикта, шаг многовопросной формы) → текст в него;
-5. открытые подходящие карточки (`deliveries_with_status(Sent)` + фильтр): одна → `chat_text_answer`; несколько → просьба ответить reply на нужную, список `issue_ref`, ничего не отправляется; ни одной → «Сейчас нет вопросов, на которые можно ответить текстом. Сообщение не отправлено.».
+### 4.4. Telegram → Paperclip (`core/poller.rs`, `core/inbound.rs`, `core/outbox.rs`)
 
-`chat_text_answer`: `validate_text` (длина, формат; нарушение даёт сообщение с причиной, а в состоянии ничего не меняется, вопрос открыт), затем `Effects::enqueue(Resolution::Respond { otherText })` + удаление остатка draft + сообщение «📨 … принят и поставлен в очередь отправки». Дальше путь тот же, что у любого ответа: `commit_update` в одной транзакции с offset, `outbox`, reconcile, защита `outbox.delivery_id UNIQUE` от второго ответа (§5). Опечатку отменить нельзя. Тесты: `tests/chat_text.rs`, `tests/crash.rs` (рестарт, повторная доставка), `docs/TESTING.md` «Пункт 1».
+1. `getUpdates(offset, TELEGRAM_LONG_POLL_TIMEOUT)` с `allowed_updates: ["message"]`. Правки (`edited_message`), реакции и `callback_query` не запрашиваются.
+2. **Allowlist** (`core/allowlist.rs: check`). Сначала чат, затем отправитель:
+   - `chat.id != TELEGRAM_CHAT_ID` → `chat_mismatch`;
+   - `from.id` не входит в `TELEGRAM_ALLOWED_USER_IDS` или поля `from` нет → `user_mismatch`. Анонимный администратор группы приходит как служебный `GroupAnonymousBot` и тоже отклоняется, если его id не добавлен в список;
+   - обновление не `message` → `unsupported`.
 
-### Ошибки Paperclip при отправке ответа (`core/outbox.rs`, классификация — `paperclip/http.rs: classify`)
+   Отклонённое обновление только сдвигает offset, без ответа. Запись в лог появляется не чаще раза в 10 с, в ней счётчик подавленных и короткий хеш `sha256(user_id)` вместо id.
+3. **Маршрут** (`inbound.rs: route`), первое совпадение выигрывает:
 
-| Ответ Paperclip | Что делает bridge |
+   | Сообщение | Действие |
+   |---|---|
+   | служебное о темах (`forum_topic_created`, `…_closed` и т. п.) | игнорируется |
+   | в General (нет `is_topic_message`) | подсказка «Пишите в тему нужного агента» в General |
+   | в теме без беседы или с беседой `removed_at` | подсказка «Эта тема не связана с беседой Paperclip» |
+   | в теме, но не текст (фото, файл, стикер) | подсказка «передаётся только текст» |
+   | текст в теме беседы | запись `pc_outbox(pending)` |
+
+   Текст отправляется как есть, `/new` тоже: Paperclip начинает новую сессию агента, как из UI (ADR-0010 §6.2).
+4. **Коммит** (`store: enqueue_message` → `commit_update`). Запись `pc_outbox` и `telegram_offset = update_id + 1` сохраняются **в одной транзакции**. `update_id` меньше сохранённого offset считается дублем и пропускается. Если обработка обновления упала, offset не сдвигается, и `poller` запрашивает то же обновление снова.
+5. **Публикация** (`outbox.rs: process`). Запись переходит в `in_flight`, затем выполняется `POST /api/issues/{issue_id}/comments` с телом `{ body, clientRequestId }` ключом беседы (`key_ref`). `clientRequestId` = `UUIDv5(NS_BRIDGE, "tg:<chat_id>:<message_id>")`, где `NS_BRIDGE` = UUIDv5 от URL репозитория (`inbound.rs: client_request_id`). Значение закреплено тестом. Заголовок `X-Paperclip-Run-Id` не передаётся. Подтверждение в Telegram не отправляется: квитанция агента придёт сама (ADR-0010 §6.4).
+
+   | Ответ Paperclip | Действие (`outbox.rs: classify`) |
+   |---|---|
+   | `2xx` | `done`, `body` обнуляется, `hot_until` беседы продлевается |
+   | `409` `Task is paused…` | `rejected`, в теме: «Беседа на паузе…» |
+   | `409` `…already used for different content` | `rejected`, ERROR. При детерминированном id такого быть не должно |
+   | `403` (`Only the conversation owner…`) | `rejected`, ERROR, в теме: «ключ бриджа принадлежит не владельцу беседы» |
+   | `404` | `rejected`, в теме: «Беседа не найдена в Paperclip или Agent Chat выключен» |
+   | `400`, `422`, прочие `4xx` | `rejected`, в теме текст ошибки сервера (до 300 символов, экранирован) |
+   | `401` | ключ отклонён (§4.6), запись остаётся `pending`, повтор раз в 5 минут |
+   | `429`, `5xx`, таймаут, сеть, нечитаемый ответ | повтор бессрочно с backoff, для `429` учитывается `Retry-After`. После `RETRY_NOTIFY_AFTER` попыток в теме появляется одно сообщение «сообщение в очереди» |
+
+   Отклонённая запись не блокирует следующие. `RETRY_MAX_ATTEMPTS` к `pc_outbox` не применяется.
+6. Комментарий bridge будит агента так же, как сообщение из UI, и так же снимает карточки с `supersedeOnUserComment` (ADR-0010 §1.3, §1.8; [PAPERCLIP_PERMISSIONS](PAPERCLIP_PERMISSIONS.md)).
+
+### 4.5. Пропавшие и удалённые темы
+
+| Что случилось | Поведение |
 |---|---|
-| 2xx | карточка `answered`, сообщение обновляется «✅ Ответ отправлен». Частичные вердикты (`request_item_verdicts`) оставляют карточку открытой |
-| 409 с кодом `interaction_*` (в т.ч. `interaction_already_resolved`, `interaction_superseded`, `interaction_issue_closed`, `interaction_stale_target`) | reconcile: карточка перечитывается. Ещё pending → повтор позже. Решена **ключом владельца и результат совпадает с нашим ответом** → успех. Иначе → «Решено в Paperclip … ваш ответ не отправлен», карточка закрыта (`outbox.rs:299-344`) |
-| 409 без кода, 5xx, 429, таймаут, ошибка соединения | повтор бессрочно с backoff (`RETRY_BASE_DELAY`…`RETRY_MAX_DELAY`, full jitter); для 429 учитывается `Retry-After`. После `RETRY_NOTIFY_AFTER`-й неудачи — одно сообщение «ответ в очереди» (`outbox.rs:347-389`) |
-| 400, 422 | запись outbox удаляется, карточка возвращается пользователю с текстом ошибки сервера (до 300 символов), можно исправить и отправить снова (`outbox.rs:116-143`) |
-| 401, 403 без audience-кода | повтор через 5 минут (`AUTH_RETRY_INTERVAL`), состояние «ключ отклонён», healthcheck unhealthy |
-| 403 с кодом `interaction_human_only`, `interaction_addressee_mismatch`, `interaction_creator_excluded`, `interaction_governed_action_denied` | карточка закрывается: «Paperclip не разрешает этому ключу ответить…, ответьте в UI» (`outbox.rs:145-155`) |
-| 404 | карточка закрывается: «Карточка не найдена в Paperclip» |
+| Тему удалили в Telegram | при следующей отправке в неё — `recreating`, новая тема, очередь уходит туда (`topics: lost`) |
+| Тему закрыли | при следующей отправке — `reopenForumTopic` |
+| Тему переименовали | связка хранится по `topic_thread_id`, имя не важно, маршрутизация не меняется |
+| Беседа пропала из `/chats` | `removed_at`; сообщения из темы не передаются, бот отвечает подсказкой. Если беседа вернётся, связь восстанавливается |
+| Вручную создали тему | сообщения в ней получают подсказку «не связана с беседой» |
 
-`RETRY_MAX_ATTEMPTS` для outbox не действует: он ограничивает только отправку в Telegram (`core/sender.rs:160`).
+### 4.6. Ключ отклонён (`core/mod.rs: key_rejected`)
 
-### Governed (`core/governed.rs`)
-
-Решение принимается по перечитанному состоянию карточки, а не по HTTP-коду. В outbox перед запросом карточка читается (`governed.rs:218-224`): уже не pending → `settle` (наше решение — успех, чужое — «решено в Paperclip»). Для `destructive` при `confirm` сначала одобряется связанный formal approval (`GET /issues/{id}/approvals` → `POST /approvals/{id}/approve`), затем принимается карточка. При отказе `destructive` — reject карточки и затем reject связанного approval, если он ещё `pending`. Любая неясная ошибка → повторное чтение, не более 3 попыток (`MAX_UNCLEAR`), затем «Не удалось, ответьте в Paperclip». Принятое действие переходит в `following` и дочитывается до `executed`/`failed`/`expired` не дольше `GOVERNED_RESULT_FOLLOW`.
+`401` от любого вызова Paperclip переводит ключ в состояние «отклонён»: `paperclip_auth_ok=false` (unhealthy), ERROR и одно сообщение в General на ключ. Состояние снимается первым успешным вызовом этим ключом. Повтор `/chats` и `POST` идёт раз в 5 минут (`AUTH_RETRY_INTERVAL`).
 
 ## 5. Падение посреди отправки (SIGKILL, потеря питания)
 
-Вопрос: может ли kill -9 в момент отправки ответа потерять его или отправить дважды. Ответ: **нет**; дублироваться может только карточка (вопрос) в Telegram.
+Вопрос: может ли kill -9 потерять сообщение или отправить его дважды. Короткий ответ: **сообщения в Paperclip не теряются и не дублируются; ответ агента в Telegram может прийти дважды**.
 
-Порядок для обычного ответа (`confirmation`, `checkbox`, форма, вердикты, текст как чат):
-
-| Шаг | Где | Состояние на диске |
-|---|---|---|
-| 1. Нажатие кнопки превращается в запись `outbox(pending)`; offset сдвигается **в той же транзакции** | `dialog.rs:161` → `commit_update` → `Enqueue` (`sqlite.rs:186-205`); `outbox.delivery_id UNIQUE` не даёт поставить второй ответ на ту же карточку | `outbox: pending`, `deliveries: answering` |
-| 2. `outbox_in_flight` | `outbox.rs:73` | `outbox: in_flight` |
-| 3. `POST …/interactions/{id}/accept\|reject\|respond\|verdicts` | `outbox.rs:77-80` (governed: `governed.rs:218-310`) | запись всё ещё `in_flight` |
-| 4. Коммит `outbox_done` / `abandon` / `retry` | `outbox.rs:204-211`, `store/mod.rs:439` | `outbox: done`, `deliveries: answered` |
-
-Точка краша, которую воспроизводит тест: между шагами 3 и 4 (`fault::AFTER_HTTP_BEFORE_OUTBOX_COMMIT`, `outbox.rs:81`). Раскладка по моменту падения:
+**Telegram → Paperclip.** Reconcile из v1 не нужен: «ровно один раз» обеспечивает идемпотентность сервера по `clientRequestId`.
 
 | Когда упали | Что после рестарта |
 |---|---|
-| До шага 1 (update не закоммичен) | offset не сдвинут, Telegram присылает update снова, он обрабатывается как первый (`tests/crash.rs::crash_before_commit_of_update_loses_nothing`). Если коммит успел, повтор update отсекается по offset (`sqlite.rs:155-160`) |
-| После шага 1, до POST | запись `pending` или `in_flight`; `recover()` при старте возвращает `in_flight` в `pending` (`sqlite.rs:126-131`, вызывается из `app.rs`), outbox отправит ответ |
-| POST дошёл до сервера, коммита нет (между 3 и 4) | `recover()` → `pending`; повторный POST получает `409 interaction_already_resolved`; `reconcile` перечитывает карточку и, если её решил владелец ключа тем же результатом, засчитывает как успех без второго эффекта (`outbox.rs:299-323`, `result_matches` 236-281, `resolved_by_us` 290-297). Тест: `tests/crash.rs::crash_after_http_before_outbox_commit_sends_once` (ровно один POST после рестарта, очередь пуста) |
-| После шага 4 | всё завершено |
+| До коммита обновления | offset не сдвинут, Telegram присылает обновление снова, оно обрабатывается как новое |
+| После коммита, до `POST` | запись `pending` (или `in_flight`, её `recover()` вернёт в `pending`), `pc_outbox` отправит |
+| `POST` дошёл, коммита `done` нет (`fault::AFTER_HTTP_BEFORE_OUTBOX_COMMIT`) | `recover()` → `pending`. Повторный `POST` с тем же `clientRequestId` и телом возвращает существующий комментарий без второго wake агента (ADR-0010 §1.3). Тест: `tests/crash.rs::crash_after_post_gives_exactly_one_comment` |
+| Повтор того же `update_id` | отсекается по offset и по UNIQUE `(chat_id, message_id)` |
 
-Для governed-решений повтор безопасен иначе: перед POST карточка перечитывается и, если она уже решена, вызывается `settle` без нового запроса (`governed.rs:218-224`); а повторный accept/reject сервер, по контракту, отвечает `200` (`docs/paperclip-api.md` §6.6, ADR-0008). Пока запись висит в outbox, `sync` карточку не закрывает (`sync.rs:340`, статус `answering`).
+**Paperclip → Telegram.**
 
-Что может задублироваться: **карточка в Telegram**. `cards::deliver` шлёт `sendMessage`, затем коммитит `sent`. У `sendMessage` нет идемпотентности; если процесс упал между ними, запись остаётся `sending` и после рестарта карточка отправляется ещё раз (`core/cards.rs:12-13,44-47`, `sync.rs:111-120`, `tests/crash.rs::crash_after_send_before_commit_redelivers_the_card`). Пользователь увидит два сообщения, нажатие на любое приведёт к одному ответу (одна запись outbox на карточку). Это принятый компромисс (ADR-0004).
+| Когда упали | Что после рестарта |
+|---|---|
+| После чтения комментариев, до коммита курсора (`fault::AFTER_READ_BEFORE_CURSOR_COMMIT`) | курсор и `tg_outbox` не изменились, комментарии читаются снова. Ни потерь, ни дублей. Тест: `tests/crash.rs::crash_before_cursor_commit_loses_and_duplicates_nothing` |
+| После `sendMessage`, до коммита `sent` (`fault::AFTER_SEND_BEFORE_COMMIT`) | кусок остаётся `pending` и отправляется ещё раз. **Дубль куска в Telegram — принятый компромисс** (ADR-0004): у `sendMessage` нет идемпотентности. Тест: `tests/crash.rs::crash_after_send_repeats_the_piece_without_loss` |
 
-Потеря питания: `synchronous=FULL` + WAL, подтверждённая транзакция (offset, outbox) не откатывается. Что **не проверено**: поведение на реальной файловой системе хоста при потере питания и реальный SIGKILL контейнера (проверены только инъекции отказа в процессе тестов).
+Потеря питания: `synchronous=FULL` + WAL, подтверждённая транзакция (offset, курсор, очереди) не откатывается. **Не проверено**: поведение реальной файловой системы хоста при потере питания и реальный SIGKILL контейнера. Проверены только инъекции отказа в тестах.
 
 ## 6. Остановка
 
-SIGTERM/SIGINT отменяют общий `CancellationToken` (`shutdown.rs`). Дальше `app.rs`:
+SIGTERM/SIGINT отменяют общий `CancellationToken` (`shutdown.rs`). Дальше `app.rs: run`:
 
-1. Ожидание завершения `poller`, `sync`, `runs`, `health_writer` до `SHUTDOWN_GRACE`; по истечении — предупреждение «tasks did not stop within the grace period».
-2. Ожидание завершения `outbox` (доотправка записи в работе) до `SHUTDOWN_GRACE`; по истечении — «outbox did not finish within the grace period»; запись остаётся `in_flight` и вернётся в `pending` при следующем старте.
-3. Остановка sender, `wal_checkpoint(TRUNCATE)`, финальная запись heartbeat.
+1. Ожидание `checks`, `poller`, `discovery`, `health_writer` до `SHUTDOWN_GRACE`. По истечении — WARN `tasks did not stop within the grace period`. Long poll прерывается без сдвига offset.
+2. Ожидание `pc_outbox` до `SHUTDOWN_GRACE`: новые записи не берутся, запись в работе дописывается. По истечении — WARN `pc_outbox did not finish within the grace period`. Запись остаётся `in_flight` и при следующем старте вернётся в `pending`.
+3. Остановка `sender`: его токен отменяется последним, чтобы ушли последние сообщения других задач. Затем `wal_checkpoint(TRUNCATE)` и финальная запись heartbeat.
 
-Худший случай до шага 3 — `2 × SHUTDOWN_GRACE`, поэтому `stop_grace_period` в compose должен быть строго больше (см. README).
+Худший случай до шага 3 — `2 × SHUTDOWN_GRACE`, поэтому `stop_grace_period` в compose должен быть строго больше (README, «Остановка»).
 
 ## 7. Healthcheck
 
-См. README, раздел «Healthcheck», и [ADR-0007](adr/0007-healthcheck-heartbeat.md). Состояние пишет `health::write_file` (`health.rs`), проверку делает `health::check`; `paperclip_auth_ok=false` выставляется при 401/403 и сбрасывается первым успешным вызовом Paperclip.
+[ADR-0007](adr/0007-healthcheck-heartbeat.md), `health.rs`. Раз в 15 с `health_writer` атомарно пишет `HEALTH_FILE`: `pid`, `started_at`, `written_at`, `last_telegram_ok_at`, `last_paperclip_ok_at`, `last_discovery_ok_at`, `paperclip_auth_ok`, `telegram_group_ok`, `telegram_send_ok`, `agent_chat_ok`, `queue_depth` (куски `tg_outbox` в `pending`). `bridge healthcheck` сетевых запросов не делает и возвращает unhealthy, если:
+
+- файл старше 60 с или не читается;
+- `paperclip_auth_ok=false` (`401`, §4.6);
+- `agent_chat_ok=false` (`404 Agent Chat is disabled`);
+- `telegram_group_ok=false` (проверка супергруппы, §4.1);
+- `telegram_send_ok=false` (`403`/`401` при отправке, §4.3);
+- нет успешного вызова Telegram или Paperclip дольше `HEALTH_MAX_STALE` (до первого успеха отсчёт идёт от старта).
+
+`queue_depth` и `last_discovery_ok_at` только наблюдаются и на результат не влияют. При `queue_depth > 60` в лог пишется WARN.
 
 ## 8. Логи
 
-Пишутся в stderr (`LOG_FORMAT=json|text`). Вызовы журналирования передают идентификаторы, виды, классы ошибок и длительности; тексты вопросов и ответов, payload карточек, тела запросов и токены не логируются. Токены хранятся как `SecretString`; ошибки reqwest сводятся к классу без URL (в URL Bot API есть токен). ID чужих пользователей заменяются хешем `sha256(id)[..4]` в hex (8 символов). Журнал решений для аудита: `decision from telegram queued` (`update_id`, `delivery_id`, `interaction_id`, `kind`, `risk`, `action`), `answer delivered to Paperclip`, `governed decision applied` (`outcome`).
+Логи пишутся в stderr (`LOG_FORMAT=json|text`, `LOG_LEVEL`). В записи попадают идентификаторы (`issue_id`, `comment_id`, `update_id`, `thread_id`, `pc_outbox_id`), классы ошибок и счётчики. Тексты сообщений пользователя и ответов агентов, тексты ошибок Paperclip, поле `error` запусков, тела запросов и токены не логируются. Токены хранятся как `SecretString`, ошибки reqwest сводятся к классу без URL (в URL Bot API есть токен). Id чужих пользователей Telegram заменяются хешем `sha256(id)[..4]` в hex. URL proxy печатается только схемой.
+
+Основные записи для аудита:
+
+- `conversation discovered` (`issue_id`, `identifier`, `topic`), `forum topic created`;
+- `agent replies queued for telegram`, `reply delivered to telegram`;
+- `message queued for paperclip` (`update_id`, `issue_id`, `thread_id`), `message delivered to paperclip`, `message rejected by paperclip` (`class`);
+- `ignored update from outside the allowlist` (`reason`, `sender_hash`).
+
+Telegram id автора сообщения из разрешённого списка в лог не пишется. Кто из разрешённых пользователей написал сообщение, видно только в истории темы в Telegram.

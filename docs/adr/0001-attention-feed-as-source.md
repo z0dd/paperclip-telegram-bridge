@@ -1,6 +1,6 @@
 # ADR-0001. Источник pending-вопросов — лента `attention` и карточки задачи
 
-- Статус: принято
+- Статус: заменено [ADR-0010](0010-v2-forum-bridge.md) (v2.0.0). Источник v2 — беседы Agent Chat (`GET /companies/{id}/chats`) и их комментарии, лента `attention` не используется. Текст ниже сохранён как история v1
 - Контекст: [docs/paperclip-api.md](../paperclip-api.md) §4, §5, §10
 
 ## Контекст

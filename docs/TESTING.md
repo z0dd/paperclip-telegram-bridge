@@ -1,17 +1,34 @@
 # Тестирование paperclip-telegram-bridge
 
+Документ описывает набор тестов версии 2.0.0 и составлен по `tests/` и `src/` на `main`. Тесты v1 (карточки, формы, governed, команды) удалены вместе с функциями; их описание осталось в истории git, тег `v1.1.0`.
+
 ## Состав
 
 | Что | Где | Количество |
 |---|---|---|
-| Интеграционные тесты (mock Paperclip на wiremock, fake Telegram, реальный SQLite, реальный бинарь) | `tests/*.rs`, общая обвязка в `tests/support/` | 134 |
-| Unit-тесты | `#[cfg(test)]` в `src/**` | 52 |
+| Интеграционные тесты (mock Paperclip на wiremock, fake Telegram, реальный SQLite, реальный бинарь) | `tests/*.rs`, общая обвязка в `tests/support/` | 104 |
+| Unit-тесты | `#[cfg(test)]` в `src/**` | 66 |
 | Docker smoke-test | `scripts/docker-smoke.sh`, job `docker` в `.github/workflows/ci.yml` | 11 шагов |
-| Скрипты PET-12 (compose, секреты, gitignore) | `scripts/compose-config-check.sh`, `scripts/compose-smoke.sh`, `scripts/secrets-rootless-test.sh`, `scripts/gitignore-check-test.sh` | см. раздел «PET-12» |
+| Скрипты deployment (compose, секреты, gitignore) | `scripts/compose-config-check.sh`, `scripts/compose-smoke.sh`, `scripts/secrets-rootless-test.sh`, `scripts/gitignore-check-test.sh` | см. раздел «Deployment» |
 
-Интеграционные тесты по файлам: `chat_text.rs` 16, `cli.rs` 7, `core_flow.rs` 19, `crash.rs` 7, `draft_migration.rs` 3, `e2e_binary.rs` 7, `env_proxy.rs` 1, `forms_flow.rs` 10, `governed.rs` 18, `paperclip_contract.rs` 21, `runs_commands.rs` 7, `sender.rs` 3, `store.rs` 11, `telegram_proxy.rs` 4.
+Интеграционные тесты по файлам: `cli.rs` 9, `crash.rs` 3, `e2e_binary.rs` 8, `env_proxy.rs` 1, `flow.rs` 22, `gaps.rs` 15, `notices.rs` 7, `paperclip_contract.rs` 12, `rule.rs` 5, `sender.rs` 2, `store.rs` 11, `telegram_errors.rs` 4, `telegram_proxy.rs` 5.
 
-Цифры считаются командой `grep -cE '^\s*#\[(tokio::)?test' <файл>`. Ссылки таблицы ниже проверяет `scripts/check-testing-refs.sh`.
+Что в каком файле:
+
+| Файл | Что проверяет |
+|---|---|
+| `flow.rs` | основные потоки на обвязке: обнаружение компаний и бесед, темы, Paperclip → Telegram, Telegram → Paperclip, рестарт, ошибки тем, недоступный Paperclip, отозванный ключ |
+| `gaps.rs` | рестарт с работой в обе стороны, отсутствие эха, `retry_after`, границы длины сообщения Telegram, экранирование, проверки супергруппы при старте, классификатор ошибок тем сквозным путём |
+| `notices.rs` | правило ⚠️ на обвязке: какие комментарии получают пометку |
+| `rule.rs` | таблицы правил `domain::comment`: что пересылается, что служебное сообщение |
+| `crash.rs` | краши с feature `fault-injection` |
+| `store.rs` | хранилище: миграция v1 → v2, атомарные коммиты, идемпотентность, восстановление |
+| `paperclip_contract.rs`, `telegram_errors.rs` | HTTP-клиенты и классификация ошибок на mock-серверах |
+| `telegram_proxy.rs`, `env_proxy.rs` | Telegram только через proxy, `HTTP(S)_PROXY` игнорируется, токен не попадает в ошибки |
+| `sender.rs` | темп очереди Telegram и `retry_after` |
+| `cli.rs`, `e2e_binary.rs` | подкоманды бинаря, SIGTERM, проверки при старте, проверка версии Paperclip |
+
+Цифры считаются командой `grep -cE '^\s*#\[(tokio::)?test' <файл>`. Ссылки в таблицах ниже проверяет `scripts/check-testing-refs.sh`.
 
 ## Как запускать
 
@@ -23,217 +40,147 @@ bash scripts/docker-smoke.sh          # нужны docker и jq; образ pape
 bash scripts/check-testing-refs.sh    # каждая ссылка «файл::тест» из этого документа существует
 ```
 
+Crash-тесты без feature `fault-injection` не компилируются (`#![cfg(feature = "fault-injection")]`). Точки отказа глобальные, поэтому тесты `crash.rs` берут общий мьютекс и идут по одному.
+
 Образ для smoke-test: `docker build -t paperclip-telegram-bridge:test .`. Внешняя сеть и настоящие credentials не нужны: токены фиктивные (`TEST-DUMMY-TOKEN`, `pcp_dummy`), upstream-адреса указывают на закрытый порт `127.0.0.1:9`.
 
 CI (`gh pr checks`): `fmt`, `clippy`, `test`, `deny`, `gitignore-secrets`, `compose-config`, `rootless-secrets`, `docker` (сборка с `load: true` + smoke-test + compose smoke) на каждый push в PR.
 
-## Docker smoke-test
+## Обвязка
 
-Скрипт использует `docker` CLI, `jq`, `ps` на хосте раннера и `docker exec ... /usr/local/bin/bridge healthcheck` (в distroless-образе нет shell, больше ничего внутри не запускается).
+`tests/support/` содержит три заменителя внешнего мира:
 
-| Шаг | Проверка |
-|---|---|
-| 1 | `Config.User` не пуст и не `0`/`root` |
-| 2 | `Config.ExposedPorts` пуст |
-| 3 | `docker run --rm ... check-config` с теми же env: exit 0, в выводе нет токенов |
-| 4 | Сервис стартует штатной командой с `--read-only`, `--cap-drop ALL`, `no-new-privileges`, state в named volume |
-| 5 | `bridge healthcheck` сразу после старта → exit 0 (отсчёт идёт от старта процесса, `src/health.rs`) |
-| 6 | Через ≥5 с `State.Running == true`, `RestartCount == 0`, `ReadonlyRootfs == true` |
-| 7 | `docker port` пуст |
-| 8 | uid процесса на хосте (`ps -o uid= -p <State.Pid>`) не `0` |
-| 9 | Через ≥3 с `docker exec -e HEALTH_MAX_STALE=1s ... healthcheck` → exit ≠ 0 и в выводе `no successful` (upstream на закрытом порту) |
-| 10 | В `docker logs` нет `TEST-DUMMY-TOKEN` и `pcp_dummy` |
-| 11 | `docker stop -t 15`: `ExitCode == 0` и длительность < 12 с (`SHUTDOWN_GRACE=10s`) |
+- `PaperclipMock` (`support/paperclip.rs`): компании, агенты, беседы и комментарии в памяти. Якорь курсора `after` возвращается в ответе, как у живого сервера. `POST` комментария считается по `clientRequestId`: тот же id и тот же текст возвращает существующий комментарий, другой текст даёт `409`. Можно принудительно вернуть ошибку (`Forced`).
+- `FakeTelegram` (`support/harness.rs`): записывает отправленные сообщения по темам, создаёт темы с растущим `message_thread_id`, умеет возвращать ошибки Bot API.
+- `Harness`: собирает ядро bridge на реальном SQLite и этих заменителях, позволяет прокручивать циклы (`sync`, `outbox`, `drain`) и перезапускать процесс на том же файле состояния (`restart`).
+- `ForwardProxy`/`CountingListener` (`support/proxy.rs`): тестовый proxy для проверки, что запросы к Telegram идут только через него.
 
-## Покрытие: ТЗ, раздел «Тесты» → тесты
+## Покрытие: ADR-0010 §3.3, обязательные сценарии
 
 Статус: **покрыто** / **слабо** (есть тест, но часть требования проверена косвенно) / **не покрыто**.
 
-| Требование ТЗ | Тесты | Статус |
-|---|---|---|
-| unit-тесты разбора Telegram updates (message / callback / неизвестные) | `src/core/allowlist.rs::updates_are_parsed` | покрыто |
-| allowlist chat/user (чужой chat, чужой user, группа) | `src/core/allowlist.rs::admits_owner`, `src/core/allowlist.rs::rejects_foreign_chat_user_and_groups`, `tests/core_flow.rs::foreign_updates_are_ignored_silently` | покрыто |
-| чужие updates журналируются без содержимого | `src/core/allowlist.rs::rejection_log_is_rate_limited`, `tests/core_flow.rs::foreign_updates_are_ignored_silently` | покрыто |
-| interaction → Telegram-сообщение | `tests/core_flow.rs::interaction_becomes_a_message_with_buttons`, `src/render/cards.rs::confirmation_card_is_escaped_and_has_buttons`, `src/render/cards.rs::checkbox_card_marks_selection` | покрыто |
-| callback → ответ в Paperclip | `tests/core_flow.rs::callback_sends_accept_once_and_updates_the_card`, `tests/core_flow.rs::checkbox_selection_is_sent`, `tests/paperclip_contract.rs::resolution_request_bodies_match_contract` | покрыто |
-| multi-question формы | `tests/forms_flow.rs::full_form_with_back_validation_and_summary`, `tests/forms_flow.rs::cancel_resets_the_draft_and_partial_form_is_not_sent`, `tests/forms_flow.rs::too_many_questions_is_only_a_notice`, `tests/forms_flow.rs::single_question_single_select_submits_on_press` | покрыто |
-| идемпотентность | `tests/store.rs::duplicate_update_has_one_effect`, `tests/store.rs::at_most_one_outbox_entry_per_card`, `tests/store.rs::duplicate_interaction_is_not_inserted_twice`, `tests/core_flow.rs::callback_sends_accept_once_and_updates_the_card`, `tests/governed.rs::accept_with_failed_result_and_repeat_is_one_effect` | покрыто |
-| восстановление состояния после рестарта | `tests/store.rs::state_survives_restart`, `tests/store.rs::crash_in_flight_and_sending_are_recovered`, `tests/forms_flow.rs::restart_in_the_middle_of_a_form_continues` | покрыто |
-| duplicate Telegram update | `tests/core_flow.rs::duplicate_update_is_processed_once`, `tests/store.rs::duplicate_update_has_one_effect`, `tests/crash.rs::crash_before_commit_of_update_loses_nothing` | покрыто |
-| недоступный Paperclip | `tests/paperclip_contract.rs::unreachable_paperclip_is_transient_and_leaks_nothing`, `tests/core_flow.rs::paperclip_down_answer_waits_and_is_delivered_later`, `tests/runs_commands.rs::commands_report_paperclip_unavailable` | покрыто |
-| недоступный Xray (proxy) | `tests/telegram_proxy.rs::unavailable_proxy_means_zero_direct_requests`, `tests/core_flow.rs::telegram_down_delivery_is_retried_next_cycle` | покрыто |
-| отсутствие direct fallback к Telegram | `tests/telegram_proxy.rs::unavailable_proxy_means_zero_direct_requests`, `tests/telegram_proxy.rs::every_request_goes_through_the_proxy`, `tests/telegram_proxy.rs::proxy_is_mandatory_in_the_type`, `tests/e2e_binary.rs::sigterm_during_long_poll_exits_zero` (число запросов через proxy равно числу запросов к mock) | покрыто |
-| integration с mock Paperclip и mock Telegram | `tests/core_flow.rs`, `tests/forms_flow.rs`, `tests/governed.rs`, `tests/runs_commands.rs`, `tests/e2e_binary.rs::sigterm_with_answer_in_flight_finishes_it` | покрыто |
-| Docker smoke-test без настоящих credentials | `scripts/docker-smoke.sh` (шаги 1–11), job `docker` в CI | покрыто |
+| № | Сценарий | Тесты | Статус |
+|---|---|---|---|
+| 1 | Две компании: обе темы созданы, ответы идут в свои темы | `tests/flow.rs::two_companies_get_their_topics_and_replies`, `tests/flow.rs::several_keys_see_their_companies` | покрыто |
+| 2 | Новая беседа появляется на ходу: тема без рестарта | `tests/flow.rs::new_conversation_gets_a_topic_without_restart` | покрыто |
+| 3 | Фильтр: уходят ответы агента, квитанции и служебные сообщения с ⚠️; сообщения пользователя нет | `tests/flow.rs::agent_replies_receipts_and_system_notices_go_to_telegram`, `tests/flow.rs::service_notices_are_marked_and_replies_are_not`, `tests/rule.rs::should_forward_table`, `tests/rule.rs::author_types_are_parsed_strictly`, `tests/gaps.rs::own_comment_is_not_echoed_back_to_telegram`, `src/domain/comment.rs::agent_replies_and_receipts_are_forwarded`, `src/domain/comment.rs::user_foreign_and_deleted_comments_are_not` | покрыто. Системные комментарии пересылаются с ⚠️, это решение пользователя (ARCHITECTURE §4.3, «Отличие от ADR-0010 §6.3») |
+| 4 | История до обнаружения не пересылается | `tests/flow.rs::history_before_discovery_is_not_forwarded`, `tests/store.rs::conversation_is_inserted_once_with_its_watermark_seen` | покрыто |
+| 5 | Сообщение из темы → один POST с ожидаемым `clientRequestId`; повтор `update_id` не даёт второго | `tests/flow.rs::telegram_message_becomes_one_comment`, `tests/gaps.rs::same_text_in_two_messages_gives_two_comments_and_the_same_update_one`, `tests/store.rs::duplicate_update_queues_one_message_and_offset_moves_once`, `src/core/inbound.rs::client_request_id_is_a_stable_uuid_v5`, `tests/paperclip_contract.rs::post_comment_sends_client_request_id_without_run_id` | покрыто |
+| 6а | Крах после POST, до коммита `pc_outbox`: после рестарта один комментарий | `tests/crash.rs::crash_after_post_gives_exactly_one_comment` | покрыто (feature `fault-injection`) |
+| 6б | Крах после `sendMessage`, до коммита `sent`: дубль допустим, потерь нет | `tests/crash.rs::crash_after_send_repeats_the_piece_without_loss` | покрыто (feature `fault-injection`) |
+| 6в | Крах после чтения комментариев, до коммита курсора: ни потерь, ни дублей | `tests/crash.rs::crash_before_cursor_commit_loses_and_duplicates_nothing` | покрыто (feature `fault-injection`) |
+| 6г | Рестарт с работой в очереди в обе стороны | `tests/gaps.rs::restart_with_work_pending_in_both_directions_loses_and_repeats_nothing`, `tests/store.rs::in_flight_message_returns_to_pending_after_a_crash` | покрыто |
+| 7 | Рестарт: темы не создаются заново, курсоры и offset сохраняются | `tests/flow.rs::restart_keeps_topics_cursor_and_offset`, `tests/store.rs::topics_are_created_lost_and_recreated` | покрыто |
+| 8 | Allowlist и чужой чат | `tests/flow.rs::foreign_chat_user_general_and_media_are_not_forwarded`, `src/core/allowlist.rs::admits_listed_users_in_the_group`, `src/core/allowlist.rs::rejects_foreign_chat_and_user`, `src/core/allowlist.rs::rejection_log_is_rate_limited`, `src/core/allowlist.rs::topic_messages_are_parsed` | покрыто |
+| 9 | Нарезка и Markdown → HTML; fallback на простой текст | `tests/flow.rs::long_reply_is_split_in_order`, `tests/flow.rs::very_long_reply_is_cut_to_max_message_chunks`, `tests/flow.rs::broken_html_falls_back_to_plain_text`, `tests/telegram_proxy.rs::plain_text_is_sent_without_parse_mode`, `src/render/markdown.rs::inline_markup`, `src/render/markdown.rs::blocks`, `src/render/mod.rs::chunks_fit_the_telegram_limit`, `src/render/mod.rs::long_comment_is_cut_with_a_pointer` | покрыто. Лимит куска 3500 UTF-16 (`render/text.rs: CHUNK_LIMIT`), а не 4096: запас на экранирование и теги |
+| 10 | Удалённая тема → пересоздание и доставка; закрытая → reopen | `tests/flow.rs::deleted_topic_is_recreated_and_the_reply_delivered`, `tests/flow.rs::closed_topic_is_reopened`, `tests/gaps.rs::topic_error_texts_end_to_end_on_the_real_classifier_outcomes`, `tests/telegram_errors.rs::topic_calls_use_the_same_classification` | покрыто на mock. Реальные тексты ошибок Telegram вживую не проверены ([paperclip-api.md](paperclip-api.md) §8) |
+| 11 | Курсор с якорем не даёт дублей; пустой ответ при сдвинутом `updatedAt` → fallback по `desc` | `tests/flow.rs::anchor_returned_again_gives_no_duplicates_in_both_server_modes`, `tests/flow.rs::vanished_anchor_is_recovered_from_the_newest_page`, `tests/paperclip_contract.rs::comments_cursor_and_latest_queries`, `tests/store.rs::pieces_cursor_and_seen_commit_together_and_keep_order`, `tests/store.rs::seen_purge_keeps_cursor_and_newest` | покрыто |
+| 12 | Проверки супергруппы при старте (не форум, нет прав) | `tests/gaps.rs::start_checks_accept_only_a_forum_supergroup_with_an_admin_bot`, `tests/gaps.rs::start_check_errors_split_into_setup_and_try_again`, `tests/e2e_binary.rs::wrong_group_is_an_error_without_exit`, `tests/e2e_binary.rs::start_checks_go_through_the_proxy` | покрыто |
 
-## Покрытие: architecture §12, колонка «Test Engineer проверяет»
+## Покрытие по областям
 
-### Этап 1. Конфигурация и Docker
+### Конфигурация и CLI
 
 | Требование | Тесты | Статус |
 |---|---|---|
-| парсинг конфигурации | `src/config.rs::parses_minimal_config_with_defaults`, `src/config.rs::optional_values_are_parsed`, `src/config.rs::invalid_values_name_the_variable` | покрыто |
+| парсинг конфигурации, значения по умолчанию, длительности | `src/config.rs::parses_minimal_config_with_defaults`, `src/config.rs::optional_values_are_parsed`, `src/config.rs::durations`, `src/config.rs::invalid_values_name_the_variable` | покрыто |
+| несколько ключей, список пользователей, взаимоисключение `PAPERCLIP_TOKEN_FILE` и `PAPERCLIP_TOKEN_FILES` | `src/config.rs::several_keys_and_users`, `src/config.rs::key_variables_are_mutually_exclusive` | покрыто |
 | `*_FILE` секреты | `src/config.rs::secret_file_trims_trailing_newline`, `src/config.rs::empty_secret_file_is_rejected`, `src/config.rs::missing_secret_file_is_rejected` | покрыто |
-| отказ без proxy | `src/config.rs::missing_proxy_is_rejected`, `tests/cli.rs::check_config_fails_without_proxy`, `tests/cli.rs::run_fails_without_proxy_before_any_network` | покрыто |
-| отказ с неверной схемой proxy | `src/config.rs::proxy_scheme_is_validated_without_echoing_value` | покрыто |
-| секрет не печатается в Debug/логах | `src/config.rs::secrets_are_redacted_in_debug`, `src/config.rs::proxy_debug_hides_credentials`, `tests/cli.rs::check_config_ok_does_not_print_secrets`, `src/logging.rs::hash_is_short_and_stable` | покрыто |
+| отказ без proxy, неверная схема proxy | `src/config.rs::missing_proxy_is_rejected`, `src/config.rs::proxy_scheme_is_validated_without_echoing_value`, `tests/cli.rs::check_config_fails_without_proxy`, `tests/cli.rs::run_fails_without_proxy_before_any_network` | покрыто |
+| секрет не печатается в Debug и логах | `src/config.rs::secrets_are_redacted_in_debug`, `src/config.rs::proxy_debug_hides_credentials`, `src/core/mod.rs::key_ref_has_no_key_material`, `tests/cli.rs::check_config_ok_does_not_print_secrets`, `src/logging.rs::hash_is_short_and_stable` | покрыто |
+| переменные v1: `PAPERCLIP_COMPANY_IDS`, `TELEGRAM_USER_ID` отклоняют старт, остальные дают WARN | `src/config.rs::removed_v1_variables_stop_the_start_with_a_hint`, `src/config.rs::obsolete_v1_variables_are_only_reported`, `tests/cli.rs::v1_configuration_is_refused_with_a_migration_hint`, `tests/cli.rs::obsolete_v1_variables_only_warn` | покрыто |
+| неизвестная подкоманда | `tests/cli.rs::unknown_subcommand_is_usage_error` | покрыто |
+| `revoke-paperclip-key` | `tests/cli.rs::revoke_paperclip_key_calls_revoke_current`, `tests/cli.rs::revoke_failure_is_reported_without_secrets`, `tests/paperclip_contract.rs::revoke_current_key` | покрыто |
 | exit-коды `healthcheck` | `tests/cli.rs::healthcheck_exit_codes`, `src/health.rs::unhealthy_cases`, `src/health.rs::fresh_file_is_healthy`, `src/health.rs::grace_after_start_before_first_success` | покрыто |
+| heartbeat-файл, чтение файла v1 | `src/health.rs::tracker_snapshot`, `src/health.rs::v1_health_file_is_still_readable` | покрыто |
+| признаки unhealthy: ключ отклонён, Agent Chat выключен, группа не прошла проверку, Telegram `403` | `src/health.rs::unhealthy_cases`; сквозные случаи — `tests/flow.rs::rejected_key_is_reported_and_unhealthy`, `tests/flow.rs::agent_chat_disabled_is_reported_once_and_unhealthy` | покрыто. Сквозного теста на `telegram_send_ok=false` и на `telegram_group_ok=false` через сервис нет, оба признака проверены только в `unhealthy_cases` и `gaps::start_check_errors_split_into_setup_and_try_again` |
 | `docker run` non-root, read-only FS, нет портов | `scripts/docker-smoke.sh`, шаги 1, 2, 4, 6, 7, 8 | покрыто |
-| healthcheck healthy в штатной работе | `scripts/docker-smoke.sh` шаг 5 (только окно «после старта»); healthy после успешных вызовов: `src/health.rs::fresh_file_is_healthy`, `src/health.rs::tracker_snapshot` | слабо: в smoke-test нет живых mock-серверов, поэтому «healthy после успешных вызовов» проверяется только на уровне библиотеки; unhealthy-ветка проверена и в smoke (шаг 9) |
+| healthcheck healthy в штатной работе | `scripts/docker-smoke.sh` шаг 5 (только окно «после старта»), `src/health.rs::fresh_file_is_healthy`, `src/health.rs::tracker_snapshot` | слабо: в smoke-test нет живых mock-серверов, поэтому «healthy после успешных вызовов» проверяется только на уровне библиотеки; unhealthy-ветка проверена и в smoke (шаг 9) |
 
-### Этап 2. Paperclip API client
+### Клиент Paperclip
 
 | Требование | Тесты | Статус |
 |---|---|---|
-| все kinds interactions | `tests/paperclip_contract.rs::question_set_form_is_parsed`, `tests/paperclip_contract.rs::legacy_questions_are_parsed`, `tests/paperclip_contract.rs::confirmation_checkbox_and_verdicts_are_parsed`, `tests/paperclip_contract.rs::governed_cards_are_parsed`, `tests/paperclip_contract.rs::unsupported_kinds_are_marked` | покрыто |
-| accept / reject / respond | `tests/paperclip_contract.rs::resolution_request_bodies_match_contract`, `tests/paperclip_contract.rs::governed_accept_sends_empty_body_without_remember_action` | покрыто |
-| все 409-коды | `tests/paperclip_contract.rs::conflict_codes_are_classified` | покрыто |
-| 403 audience | `tests/paperclip_contract.rs::auth_and_audience_errors_are_classified` | покрыто |
-| 422 и 5xx | `tests/paperclip_contract.rs::validation_and_server_errors_are_classified` | покрыто |
-| 429 `retry_after` в клиенте | `tests/paperclip_contract.rs::rate_limit_carries_retry_after` | покрыто |
-| таймаут | `tests/paperclip_contract.rs::timeout_is_transient` | покрыто |
-| недоступный Paperclip | `tests/paperclip_contract.rs::unreachable_paperclip_is_transient_and_leaks_nothing` | покрыто |
-| лента attention, issues, runs, agents, revoke | `tests/paperclip_contract.rs::attention_maps_all_source_kinds`, `tests/paperclip_contract.rs::attention_follows_cursor_and_restarts_on_stale_cursor`, `tests/paperclip_contract.rs::issues_runs_agents_and_revoke`, `tests/paperclip_contract.rs::approvals_are_listed_and_approved`, `tests/paperclip_contract.rs::base_url_with_path_prefix_is_respected` | покрыто |
-| Bearer без run-id | `tests/paperclip_contract.rs::sends_bearer_token_and_no_run_id_header` | покрыто |
+| `GET /api/health`, версия | `tests/paperclip_contract.rs::health_is_parsed` | покрыто |
+| компании: `scope=accessible`, Bearer-токен, архивные отбрасываются | `tests/paperclip_contract.rs::companies_use_scope_accessible_and_bearer_token`, `src/paperclip/dto.rs::companies_are_parsed` | покрыто |
+| беседы и агенты; беседа без `conversationAgentId` не берётся | `tests/paperclip_contract.rs::chats_and_agents_are_parsed`, `src/paperclip/dto.rs::chats_require_a_conversation_agent` | покрыто |
+| комментарии: курсор, `order`, `limit`, разбор видов | `tests/paperclip_contract.rs::comments_cursor_and_latest_queries`, `src/paperclip/dto.rs::comment_kinds_are_parsed` | покрыто |
+| `heartbeat-runs/{id}`: разбираются только `status` и `error` | `src/paperclip/dto.rs::runs_are_parsed`, `tests/notices.rs` | покрыто |
+| `POST` комментария с `clientRequestId`, без `X-Paperclip-Run-Id` | `tests/paperclip_contract.rs::post_comment_sends_client_request_id_without_run_id` | покрыто |
+| классификация ответов на `POST` (`409` с кодом и без, `403`, `404`, `422`, `5xx`) | `src/core/outbox.rs::answers_are_classified_as_in_the_adr_table`, `tests/paperclip_contract.rs::errors_keep_the_server_text_for_classification` | покрыто |
+| `429 Retry-After` | `tests/paperclip_contract.rs::rate_limit_carries_retry_after` | покрыто |
+| нечитаемый ответ списка | `tests/paperclip_contract.rs::malformed_lists_are_decode_errors` | покрыто |
+| таймаут, недоступный Paperclip, секреты не в ошибках | `tests/paperclip_contract.rs::timeout_is_transient`, `tests/paperclip_contract.rs::unreachable_paperclip_is_transient_and_leaks_nothing` | покрыто |
+| путь-префикс в `PAPERCLIP_URL` | `tests/paperclip_contract.rs::base_url_with_path_prefix_is_respected` | покрыто |
 | клиент игнорирует `HTTP(S)_PROXY` | `tests/env_proxy.rs::env_proxy_variables_are_ignored` | покрыто |
+| ошибки по компаниям: `Agent Chat is disabled`, `401`, `403`/`404` одной компании не останавливают остальные | `tests/flow.rs::agent_chat_disabled_is_reported_once_and_unhealthy`, `tests/flow.rs::rejected_key_is_reported_and_unhealthy`, `tests/flow.rs::several_keys_see_their_companies` | слабо: пропуск компании по `403`/`404` на `/chats` и независимый бэкофф компаний отдельным тестом не проверены |
+| ключи разных пользователей: беседы чужого владельца пропускаются | | **не покрыто**: автотеста нет (THREAT_MODEL, строка «ключи разных пользователей») |
 
-### Этап 3. Telegram client, разбор, render
-
-| Требование | Тесты | Статус |
-|---|---|---|
-| разбор updates, allowlist | см. таблицу ТЗ выше | покрыто |
-| классификация ошибок Telegram | `src/telegram/http.rs::classification` | покрыто |
-| HTML-экранирование (`<`, `&`, emoji) | `src/render/text.rs::escapes_html_special_chars`, `src/render/text.rs::visible_length_ignores_tags_and_counts_entities_once` | покрыто |
-| суррогатные пары UTF-16 | `src/render/text.rs::utf16_counts_surrogate_pairs`, `src/render/text.rs::split_never_breaks_surrogate_pairs` | покрыто |
-| разбиение и лимит 4096 UTF-16 | `src/render/text.rs::split_prefers_paragraphs_then_lines_then_words`, `src/render/text.rs::split_pieces_fit_telegram_limit_after_escaping`, `src/render/text.rs::truncation`, `src/render/cards.rs::long_details_are_split_and_capped` | покрыто |
-| callback_data ≤ 64 байт для максимальных индексов | `src/render/callback.rs::maximum_values_fit_in_64_bytes`, `src/render/callback.rs::roundtrip_all_ops`, `src/render/callback.rs::example_from_architecture`, `src/render/callback.rs::rejects_garbage` | покрыто |
-| §5.3: недоступный Xray, нет direct fallback | `tests/telegram_proxy.rs::unavailable_proxy_means_zero_direct_requests`, `tests/telegram_proxy.rs::every_request_goes_through_the_proxy` | покрыто |
-| §5.3: env-proxy не влияет на Telegram | `tests/env_proxy.rs::env_proxy_variables_are_ignored` (проверка Telegram-клиента внутри `support::env_proxy_telegram_checks`) | покрыто |
-| §5.3: токен не попадает в логи при ошибке | `tests/telegram_proxy.rs::token_is_not_in_errors_or_logs_on_connection_failure` | покрыто |
-
-### Этап 4. Хранилище и рестарт
+### Клиент Telegram, render
 
 | Требование | Тесты | Статус |
 |---|---|---|
-| схема, миграции, pragma | `tests/store.rs::schema_is_versioned_and_pragmas_are_set` | покрыто |
+| классификация ошибок Bot API (в том числе тем) | `src/telegram/http.rs::classification`, `tests/telegram_errors.rs::send_message_errors_are_classified_by_code_and_text`, `tests/telegram_errors.rs::topic_calls_use_the_same_classification`, `tests/telegram_errors.rs::non_json_answers_are_classified_by_status`, `tests/telegram_errors.rs::bad_request_description_is_cut_and_never_holds_the_token` | покрыто |
+| все запросы идут через proxy, нет direct fallback | `tests/telegram_proxy.rs::unavailable_proxy_means_zero_direct_requests`, `tests/telegram_proxy.rs::every_request_goes_through_the_proxy`, `tests/telegram_proxy.rs::proxy_is_mandatory_in_the_type` | покрыто |
+| env-proxy не влияет на Telegram | `tests/env_proxy.rs::env_proxy_variables_are_ignored` (Telegram-часть внутри `support::env_proxy_telegram_checks`) | покрыто |
+| токен не попадает в логи и ошибки | `tests/telegram_proxy.rs::token_is_not_in_errors_or_logs_on_connection_failure` | покрыто |
+| HTML-экранирование, длина без тегов | `src/render/text.rs::escapes_html_special_chars`, `src/render/text.rs::visible_length_ignores_tags_and_counts_entities_once`, `tests/gaps.rs::markup_is_escaped_and_not_executed_in_telegram`, `tests/gaps.rs::escaped_characters_count_as_one_and_pieces_do_not_cut_entities` | покрыто |
+| суррогатные пары UTF-16, emoji и кириллица | `src/render/text.rs::utf16_counts_surrogate_pairs`, `src/render/text.rs::split_never_breaks_surrogate_pairs`, `tests/gaps.rs::emoji_and_cyrillic_are_counted_in_utf16_and_never_cut_in_half` | покрыто |
+| нарезка и лимит куска | `src/render/text.rs::split_prefers_paragraphs_then_lines_then_words`, `src/render/text.rs::split_never_cuts_a_word_when_a_space_follows_the_limit`, `src/render/text.rs::split_pieces_fit_telegram_limit_after_escaping`, `src/render/text.rs::truncation`, `tests/gaps.rs::messages_around_the_limit_fit_telegram_and_keep_every_character` | покрыто |
+| Markdown → HTML: разметка, нераспознанные маркеры, блоки, код, баланс тегов | `src/render/markdown.rs::inline_markup`, `src/render/markdown.rs::unmatched_or_ambiguous_markers_stay_literal`, `src/render/markdown.rs::blocks`, `src/render/markdown.rs::markup_inside_code_block_is_not_rendered`, `src/render/markdown.rs::tags_are_balanced_on_every_line`, `tests/gaps.rs::bold_lines_keep_their_tags_balanced_across_pieces` | покрыто |
+| блок кода между кусками, обрезка с указателем на Paperclip, пустой комментарий | `src/render/mod.rs::code_fence_is_reopened_across_pieces`, `src/render/mod.rs::long_comment_is_cut_with_a_pointer`, `src/render/mod.rs::empty_comment_has_no_chunks` | покрыто |
+| названия тем | `src/render/mod.rs::topic_names` | покрыто |
+
+### Хранилище и рестарт
+
+| Требование | Тесты | Статус |
+|---|---|---|
+| схема, версия, pragma | `tests/store.rs::schema_is_versioned_and_pragmas_are_set` | покрыто |
+| миграция v1 → v2: сохраняется только offset | `tests/store.rs::v1_state_is_migrated_and_offset_kept` | покрыто |
 | `integrity_check`, повреждённая БД отвергается | `tests/store.rs::corrupt_database_is_refused` | покрыто |
-| state переживает рестарт | `tests/store.rs::state_survives_restart` | покрыто |
-| один `update_id` дважды → один эффект | `tests/store.rs::duplicate_update_has_one_effect`, `tests/core_flow.rs::duplicate_update_is_processed_once` | покрыто |
-| crash после sendMessage до коммита | `tests/crash.rs::crash_after_send_before_commit_redelivers_the_card` | покрыто |
-| crash после HTTP до коммита outbox | `tests/crash.rs::crash_after_http_before_outbox_commit_sends_once` | покрыто |
-| crash до коммита update | `tests/crash.rs::crash_before_commit_of_update_loses_nothing` | покрыто |
-| восстановление in-flight/sending | `tests/store.rs::crash_in_flight_and_sending_are_recovered` | покрыто |
-| расписание retry, очистка тел | `tests/store.rs::retry_schedule_and_removal`, `tests/store.rs::finished_outbox_wipes_body_and_draft`, `src/retry.rs::ceiling_grows_exponentially_and_caps`, `src/retry.rs::delay_is_within_bounds` | покрыто |
+| беседа вставляется один раз вместе с водяным знаком | `tests/store.rs::conversation_is_inserted_once_with_its_watermark_seen` | покрыто |
+| темы: создание, потеря, пересоздание | `tests/store.rs::topics_are_created_lost_and_recreated` | покрыто |
+| куски, курсор и `seen_comments` фиксируются одной транзакцией, порядок сохраняется | `tests/store.rs::pieces_cursor_and_seen_commit_together_and_keep_order` | покрыто |
+| дубль `update_id`: одно сообщение в очереди, offset сдвигается один раз | `tests/store.rs::duplicate_update_queues_one_message_and_offset_moves_once`, `tests/flow.rs::telegram_message_becomes_one_comment` | покрыто |
+| восстановление `in_flight` после краха | `tests/store.rs::in_flight_message_returns_to_pending_after_a_crash` | покрыто |
+| очистка текстов после доставки | `tests/store.rs::finished_messages_wipe_the_body` | покрыто |
+| очистка `seen_comments`, окно «горячей» беседы | `tests/store.rs::seen_purge_keeps_cursor_and_newest`, `tests/store.rs::hot_window_only_grows` | покрыто |
+| расписание повторов | `src/retry.rs::ceiling_grows_exponentially_and_caps`, `src/retry.rs::delay_is_within_bounds`, `src/retry.rs::tiny_base_still_waits_minimum`, `src/retry.rs::jitter_is_at_most_one_second` | покрыто |
+| крах-сценарии | см. сценарии 6а–6г выше | покрыто |
 
-### Этап 5. Core
-
-| Требование | Тесты | Статус |
-|---|---|---|
-| interaction → сообщение | `tests/core_flow.rs::interaction_becomes_a_message_with_buttons` | покрыто |
-| callback → правильный запрос | `tests/core_flow.rs::callback_sends_accept_once_and_updates_the_card` | покрыто |
-| повторное нажатие → один запрос | `tests/core_flow.rs::callback_sends_accept_once_and_updates_the_card`, `tests/core_flow.rs::stale_generation_answers_outdated` | покрыто |
-| ответ в UI раньше Telegram → 409 → сообщение | `tests/core_flow.rs::answered_in_ui_first_reports_resolved_elsewhere`, `tests/core_flow.rs::card_resolved_in_ui_is_edited`, `tests/core_flow.rs::resolved_elsewhere_edit_can_be_disabled` | покрыто |
-| гонка: потерянный ответ распознаётся как наш | `tests/core_flow.rs::lost_response_is_recognised_as_our_answer`, `tests/core_flow.rs::agent_resolution_is_not_ours` | покрыто |
-| Paperclip недоступен → ответ в очереди → доставлен | `tests/core_flow.rs::paperclip_down_answer_waits_and_is_delivered_later` | покрыто |
-| ошибка валидации возвращает карточку пользователю | `tests/core_flow.rs::validation_error_returns_the_card_to_the_user` | покрыто |
-| reject с причиной, отмена | `tests/core_flow.rs::reject_with_required_reason_waits_for_text`, `tests/core_flow.rs::optional_reason_and_cancel`, `src/render/cards.rs::reject_reason_prompt_buttons` | покрыто |
-| неподдерживаемые kinds → только уведомление | `tests/core_flow.rs::unsupported_kinds_are_notifications_without_buttons`, `src/render/cards.rs::unsupported_card_has_no_buttons` | покрыто |
-| много новых карточек → сводка | `tests/core_flow.rs::many_new_cards_get_a_summary_first` | покрыто |
-| не-текстовые сообщения отвергаются | `tests/core_flow.rs::non_text_messages_are_refused` | покрыто |
-
-### Этап 6. Формы
+### Ядро: потоки данных
 
 | Требование | Тесты | Статус |
 |---|---|---|
-| полный проход, назад, валидация | `tests/forms_flow.rs::full_form_with_back_validation_and_summary` | покрыто |
-| рестарт посреди формы | `tests/forms_flow.rs::restart_in_the_middle_of_a_form_continues` | покрыто |
-| отмена, частичные ответы не уходят | `tests/forms_flow.rs::cancel_resets_the_draft_and_partial_form_is_not_sent` | покрыто |
-| более 20 вопросов → только уведомление | `tests/forms_flow.rs::too_many_questions_is_only_a_notice` | покрыто |
-| text reply, свой вариант | `tests/forms_flow.rs::own_answer_and_text_reply`, `tests/forms_flow.rs::legacy_free_text_option_is_sent_with_its_id` | покрыто |
-| `textValidation` | `src/core/forms.rs::text_validation_rules`, `tests/forms_flow.rs::server_validation_error_keeps_the_form` | покрыто |
-| verdicts частично / полностью | `tests/forms_flow.rs::verdicts_card`, `tests/forms_flow.rs::verdicts_partial_then_complete`, `tests/forms_flow.rs::verdicts_bulk_approve` | покрыто |
-| состояние ожидания текста | `src/domain/draft.rs::awaiting_roundtrip`, `src/core/forms.rs::text_validation_rules` | покрыто |
+| обнаружение компаний и бесед, несколько компаний и ключей | `tests/flow.rs::two_companies_get_their_topics_and_replies`, `tests/flow.rs::several_keys_see_their_companies`, `tests/flow.rs::new_conversation_gets_a_topic_without_restart` | покрыто |
+| беседа пропала из списка: тема отвязывается | `tests/flow.rs::removed_conversation_unlinks_its_topic` | покрыто |
+| ответы агента и квитанции → тема; история не пересылается | `tests/flow.rs::agent_replies_receipts_and_system_notices_go_to_telegram`, `tests/flow.rs::history_before_discovery_is_not_forwarded` | покрыто |
+| правило ⚠️: системные комментарии, неуспешный запуск, обычный ответ без пометки | `tests/notices.rs::system_comment_is_marked_without_a_run_lookup`, `tests/notices.rs::failed_run_notice_is_marked_whatever_the_status_or_case`, `tests/notices.rs::ordinary_reply_of_a_failed_run_is_not_marked`, `tests/notices.rs::text_equal_to_the_error_of_a_successful_run_is_not_marked`, `tests/notices.rs::long_multiline_and_run_less_comments_are_never_looked_up`, `tests/notices.rs::notice_and_replies_keep_their_order_in_one_pass`, `tests/rule.rs::is_service_notice_table`, `tests/rule.rs::system_comment_is_a_notice_by_itself`, `tests/rule.rs::pre_check_before_the_run_lookup`, `src/domain/comment.rs::system_notices_are_forwarded`, `src/domain/comment.rs::service_notices_repeat_the_error_of_a_failed_run`, `src/domain/comment.rs::ordinary_replies_are_not_service_notices` | покрыто |
+| запуск нельзя прочитать: сообщение приходит без ⚠️ и не теряется | `tests/notices.rs::run_lookup_failure_forwards_without_the_mark_and_loses_nothing` | покрыто |
+| текст из темы → один комментарий; не текст, General, тема без беседы → подсказка, в Paperclip ничего не уходит | `tests/flow.rs::telegram_message_becomes_one_comment`, `tests/flow.rs::foreign_chat_user_general_and_media_are_not_forwarded`, `tests/flow.rs::removed_conversation_unlinks_its_topic` | покрыто |
+| беседа на паузе (`409 Task is paused`) | `tests/flow.rs::paused_conversation_is_reported_in_the_topic` | покрыто |
+| недоступный Paperclip: сообщение в очереди, одно уведомление, доставка позже | `tests/flow.rs::paperclip_outage_keeps_the_message_and_tells_once` | покрыто |
+| отклонённое сообщение не блокирует следующие | `tests/gaps.rs::rejected_message_is_not_retried_and_does_not_block_the_next_one` | покрыто |
+| ключ отклонён (`401`): одно сообщение в General, unhealthy, снимается успешным вызовом | `tests/flow.rs::rejected_key_is_reported_and_unhealthy` | покрыто |
+| Agent Chat выключен | `tests/flow.rs::agent_chat_disabled_is_reported_once_and_unhealthy` | покрыто |
+| сообщение bridge в удалённую тему уходит в General | `tests/gaps.rs::service_notice_to_a_deleted_topic_goes_to_general` | покрыто |
+| `retry_after` Telegram: очередь на паузе, порядок сохраняется, темы создаются по одной | `tests/gaps.rs::retry_after_on_send_message_keeps_every_piece_in_order`, `tests/gaps.rs::retry_after_on_two_topics_creates_each_once`, `tests/flow.rs::topic_creation_waits_for_retry_after`, `tests/sender.rs::retry_after_pauses_the_queue` | покрыто |
+| темп очереди Telegram не выше `TELEGRAM_GROUP_MIN_INTERVAL` | `tests/sender.rs::calls_are_spaced_by_the_group_interval` | покрыто |
+| отсутствие эха собственных комментариев | `tests/gaps.rs::own_comment_is_not_echoed_back_to_telegram` | покрыто |
 
-### Этап 6a. Governed
-
-| Требование | Тесты | Статус |
-|---|---|---|
-| accept → `executed`/`failed`/`executing`, дочитывание статуса | `tests/governed.rs::write_action_accept_executes_and_follows_result`, `tests/governed.rs::accept_with_failed_result_and_repeat_is_one_effect` | покрыто |
-| повтор accept → один эффект | `tests/governed.rs::accept_with_failed_result_and_repeat_is_one_effect` | покрыто |
-| `409` без кода и `500` → без бесконечного retry | `tests/governed.rs::conflict_without_code_and_500_are_not_retried_forever` | покрыто |
-| destructive: второе шаг, approval, accept | `tests/governed.rs::destructive_confirm_mode_two_steps_then_approval_then_accept` | покрыто |
-| истечение второго шага | `tests/governed.rs::destructive_second_step_expires_after_two_minutes` | покрыто |
-| рестарт между шагами → без дубля | `tests/governed.rs::destructive_restart_between_steps_repeats_without_duplicate` | покрыто |
-| approval не найден → «решите в UI» | `tests/governed.rs::destructive_without_approval_asks_to_decide_in_ui`, `tests/governed.rs::approval_found_by_invocation_id_fallback` | покрыто |
-| reject → reject approval | `tests/governed.rs::reject_destructive_rejects_linked_approval`, `tests/governed.rs::write_reject_without_reason` | покрыто |
-| `secretProposal`: failed, reject без причины | `tests/governed.rs::secret_proposal_bind_and_failed_binding`, `tests/governed.rs::secret_proposal_reject_requires_reason` | покрыто |
-| истёкший `expiresAt` / изменённый `argumentsHash` | `tests/governed.rs::changed_arguments_or_expired_send_nothing`, `tests/governed.rs::hash_changed_between_queue_and_send_is_not_sent` | покрыто |
-| нет `rememberAction` в запросах | `tests/governed.rs::write_action_accept_executes_and_follows_result` (прямой assert: в телах запросов нет `rememberAction`), `tests/paperclip_contract.rs::governed_accept_sends_empty_body_without_remember_action` | покрыто |
-| нет `detailsMarkdown`/`toolName`; аргументы только по флагу | `tests/governed.rs::arguments_shown_only_with_flag_and_card_fits_one_message` | покрыто |
-| в логах нет preview/аргументов/justification | `tests/governed.rs::logs_contain_decisions_but_no_content` | покрыто |
-| `GOVERNED_APPROVALS_ENABLED=false` → только уведомление | `tests/governed.rs::governed_disabled_is_notification_only`, `tests/governed.rs::ui_only_mode_has_no_buttons_and_sends_nothing_but_write_works` | покрыто |
-
-### Этап 7. Уведомления и команды
+### Остановка и бинарь
 
 | Требование | Тесты | Статус |
 |---|---|---|
-| только новые `failed/timed_out`, без дублей | `tests/runs_commands.rs::only_new_failures_are_reported_once`, `tests/runs_commands.rs::failed_run_from_the_feed_is_reported` | покрыто |
-| без текста ошибки | `tests/runs_commands.rs::only_new_failures_are_reported_once` (assert на `SECRET-ERROR-TEXT`) | покрыто |
-| флаги `NOTIFY_RUN_FAILURES`, `NOTIFY_TASK_COMPLETED` | `tests/runs_commands.rs::run_failure_notifications_can_be_disabled`, `tests/runs_commands.rs::completed_tasks_only_with_flag` | покрыто |
-| `/status`, `/backlog`, `/help` на фикстурах | `tests/runs_commands.rs::status_and_backlog_commands`, `tests/runs_commands.rs::commands_report_paperclip_unavailable` | покрыто |
-| отозванный ключ: одно уведомление, health падает | `tests/runs_commands.rs::revoked_key_is_reported_once_and_makes_health_fail` | покрыто |
-| `setMyCommands` вызывается с правильным списком | **добавлен** `tests/e2e_binary.rs::set_my_commands_registers_the_command_list_via_proxy` | было не покрыто: fake Telegram запоминал только факт вызова (`TgCall::Commands`), без содержимого; `/help` по тексту проверен, а список из `bot_commands()` нет |
-
-### Этап 8. Hardening
-
-| Требование | Тесты | Статус |
-|---|---|---|
-| `429 retry_after` соблюдается | `tests/sender.rs::retry_after_is_honoured_and_order_kept` | покрыто |
-| лимит очереди отправки | `tests/sender.rs::messages_are_spaced_by_min_interval` | покрыто |
-| повтор временных ошибок до лимита | `tests/sender.rs::transient_errors_are_retried_up_to_the_limit` | покрыто |
 | SIGTERM во время long poll → exit 0 | `tests/e2e_binary.rs::sigterm_during_long_poll_exits_zero` | покрыто |
-| SIGTERM при in-flight outbox → exit 0, без потерь | `tests/e2e_binary.rs::sigterm_with_answer_in_flight_finishes_it` | покрыто |
+| SIGTERM с сообщением в работе → exit 0, без потерь | `tests/e2e_binary.rs::sigterm_with_message_in_flight_finishes_it` | покрыто |
+| запросы к Telegram при старте идут через proxy | `tests/e2e_binary.rs::start_checks_go_through_the_proxy` | покрыто |
 | Docker smoke-test: non-root, read-only, healthcheck, порты, SIGTERM | `scripts/docker-smoke.sh` | покрыто (см. замечание про healthy выше) |
 | Docker smoke-test с mock-серверами в docker network | не делался | слабо: smoke использует закрытые порты вместо mock-серверов; сквозные сценарии с mock Paperclip/Telegram покрыты `tests/e2e_binary.rs` (реальный бинарь) вне контейнера |
 
-## PET-12 (v1.1.0): критерий приёмки → тест → job CI
+## Deployment и версия Paperclip (ADR-0009)
 
-Источник критериев: ADR-0009 (`docs/adr/0009-v1.1.0-improvements.md`). Тесты Rust выполняет job `test` (`cargo test --all-features`, включая crash-тесты с feature `fault-injection`); скрипты — отдельные job'ы. Строки «№» — строки таблицы ADR-0009 §1.
-
-### Пункт 1. Текст как чат (ADR-0009 §1)
-
-| Сценарий | Тест | Job CI |
-|---|---|---|
-| Карточка однотекстового вопроса без кнопки «Ответить текстом», только подсказка | `tests/chat_text.rs::card_has_no_text_button_only_a_hint` | test |
-| №6: reply на карточку, ответ уходит сразу, без подтверждения | `tests/chat_text.rs::reply_to_card_is_queued_at_once`, `tests/forms_flow.rs::own_answer_and_text_reply` | test |
-| №12: без reply, одна подходящая карточка | `tests/chat_text.rs::message_without_reply_answers_the_only_card` | test |
-| №13: без reply, несколько карточек, ничего не отправляется | `tests/chat_text.rs::several_cards_ask_for_a_reply_and_send_nothing`, `tests/chat_text.rs::several_cards_in_different_issues_are_listed` | test |
-| №14: нет подходящей карточки, ничего не уходит в Paperclip | `tests/chat_text.rs::no_suitable_card_sends_nothing_to_paperclip`, `tests/core_flow.rs::reject_with_required_reason_waits_for_text` | test |
-| №7: невалидный текст, вопрос остаётся открытым | `tests/chat_text.rs::invalid_text_keeps_the_question_open` | test |
-| №5, №11: ожидающий сценарий (причина reject и т. п.) забирает текст первым | `tests/chat_text.rs::waiting_scenario_takes_the_text_first`, `tests/chat_text.rs::waiting_without_reply_does_not_answer_the_text_card` | test |
-| №8: reply на неподходящую карточку работает как раньше | `tests/chat_text.rs::reply_to_an_unsuitable_card_works_as_before`, `tests/chat_text.rs::multi_question_form_still_uses_the_text_button` | test |
-| №9, №15: повторный текст не даёт второго ответа | `tests/chat_text.rs::second_text_after_the_answer_is_not_sent` | test |
-| №10: reply на сообщение, не являющееся карточкой | `tests/chat_text.rs::reply_to_a_message_that_is_not_a_card_is_routed_like_plain_text` | test |
-| №3: повторная доставка того же update | `tests/chat_text.rs::repeated_update_is_ignored`, `tests/core_flow.rs::duplicate_update_is_processed_once` | test |
-| №16: старая кнопка → «Устарело» | `tests/chat_text.rs::old_text_button_is_stale` | test |
-| №17: отказ сервера (422) возвращает вопрос | `tests/chat_text.rs::server_rejection_reopens_the_question` | test |
-| №18: рестарт с непустым outbox, без reply | `tests/crash.rs::chat_text_answer_survives_a_restart_and_is_sent_once` | test (feature `fault-injection`) |
-| №18: рестарт с непустым outbox, reply | `tests/crash.rs::chat_text_reply_survives_a_restart_and_is_sent_once` | test (feature `fault-injection`) |
-| №18: падение после HTTP до коммита, reply: нет второго ответа | `tests/crash.rs::chat_text_crash_after_http_reconciles_without_a_second_answer` | test (feature `fault-injection`) |
-| №18: падение после HTTP до коммита, без reply: нет второго ответа | `tests/crash.rs::chat_text_without_reply_crash_after_http_reconciles_without_a_second_answer` | test (feature `fault-injection`) |
-| Регрессия неизменённых карточек: варианты, формы | `tests/forms_flow.rs::full_form_with_back_validation_and_summary`, `tests/forms_flow.rs::single_question_single_select_submits_on_press`, `tests/forms_flow.rs::legacy_free_text_option_is_sent_with_its_id` | test |
-| Регрессия: Approve/Reject | `tests/core_flow.rs::callback_sends_accept_once_and_updates_the_card`, `tests/core_flow.rs::reject_with_required_reason_waits_for_text`, `tests/core_flow.rs::optional_reason_and_cancel` | test |
-| Регрессия: destructive | `tests/governed.rs::destructive_confirm_mode_two_steps_then_approval_then_accept`, `tests/governed.rs::destructive_restart_between_steps_repeats_without_duplicate`, `tests/governed.rs::reject_destructive_rejects_linked_approval` | test |
-
-Правки старых тестов в PET-15 (`git diff main...pet-12-improvements -- tests/`) соответствуют ADR и ожиданий не ослабляют: `tests/core_flow.rs::reject_with_required_reason_waits_for_text` меняет только текст подсказки «Не жду текста» → «Сейчас нет вопросов, на которые можно ответить текстом» (строка 14); `tests/forms_flow.rs::own_answer_and_text_reply` убирает нажатие «Отправить» после reply, потому что подтверждения больше нет (строка 6), при этом проверка тела `respond` сохранена.
-
-### Пункт 2. Миграция старых draft (ADR-0009 §2)
-
-| Сценарий | Тест | Job CI |
-|---|---|---|
-| Первый старт: сброшены только draft однотекстовых карточек (A, D), B и C не тронуты, outbox пуст, к Paperclip нет POST | `tests/draft_migration.rs::first_start_resets_only_text_card_drafts` | test |
-| Второй старт ничего не меняет | `tests/draft_migration.rs::second_start_changes_nothing` | test |
-| Отказ перерисовки не останавливает старт, старая кнопка → «Устарело» | `tests/draft_migration.rs::failed_rerender_does_not_stop_the_start` | test |
+Источник критериев: ADR-0009 (`docs/adr/0009-v1.1.0-improvements.md`), пункты 3–5; они остаются в силе в v2. Тесты Rust выполняет job `test` (`cargo test --all-features`, включая crash-тесты с feature `fault-injection`); скрипты — отдельные job'ы.
 
 ### Пункт 3. Проверка версии Paperclip (ADR-0009 §3)
 
@@ -255,10 +202,29 @@ CI (`gh pr checks`): `fmt`, `clippy`, `test`, `deny`, `gitignore-secrets`, `comp
 | Секреты в `.gitignore` (позитивная проверка) | шаг «Check that secrets paths are gitignored» | `gitignore-secrets` |
 | Проверка gitignore падает при удалении правил (негативная, на временной копии) | `scripts/gitignore-check-test.sh` | `gitignore-secrets` |
 
-Ручные проверки, которых CI не заменяет: живой деплой на сервере пользователя (реальный Paperclip, Xray, rootless Docker с `network_mode: host`) и внешний вид карточек в клиенте Telegram.
+Ручные проверки, которых CI не заменяет: живой деплой на сервере пользователя (реальный Paperclip, Xray, rootless Docker с `network_mode: host`), живой smoke-тест пробуждения агента комментарием board-ключа (ADR-0010 §1.3), тексты ошибок Telegram для удалённой и закрытой темы, внешний вид тем и сообщений в клиенте Telegram.
+
+## Docker smoke-test
+
+Скрипт использует `docker` CLI, `jq`, `ps` на хосте раннера и `docker exec ... /usr/local/bin/bridge healthcheck` (в distroless-образе нет shell, больше ничего внутри не запускается).
+
+| Шаг | Проверка |
+|---|---|
+| 1 | `Config.User` не пуст и не `0`/`root` |
+| 2 | `Config.ExposedPorts` пуст |
+| 3 | `docker run --rm ... check-config` с теми же env: exit 0, в выводе нет токенов |
+| 4 | Сервис стартует штатной командой с `--read-only`, `--cap-drop ALL`, `no-new-privileges`, state в named volume |
+| 5 | `bridge healthcheck` сразу после старта → exit 0 (отсчёт идёт от старта процесса, `src/health.rs`) |
+| 6 | Через ≥5 с `State.Running == true`, `RestartCount == 0`, `ReadonlyRootfs == true` |
+| 7 | `docker port` пуст |
+| 8 | uid процесса на хосте (`ps -o uid= -p <State.Pid>`) не `0` |
+| 9 | Через ≥3 с `docker exec -e HEALTH_MAX_STALE=1s ... healthcheck` → exit ≠ 0 и в выводе `no successful` (upstream на закрытом порту) |
+| 10 | В `docker logs` нет `TEST-DUMMY-TOKEN` и `pcp_dummy` |
+| 11 | `docker stop -t 15`: `ExitCode == 0` и длительность < 12 с (`SHUTDOWN_GRACE=10s`) |
 
 ## Известные ограничения набора
 
-- Тесты таймингов `tests/sender.rs` работают на коротких реальных интервалах, а не на `tokio::time::pause()`. Они проходят в CI, но по принципу остаются потенциально чувствительными к нагрузке раннера. Переписывать на виртуальное время не стал: это правка обвязки, не покрытия.
-- Governed-сценарии проверены только на фикстурах контракта (API §6.6): в компании нет реальных инструментов с approval. Живая проверка выполняется при деплое.
+- Тесты таймингов `tests/sender.rs` работают на коротких реальных интервалах, а не на `tokio::time::pause()`. Они проходят в CI, но по принципу остаются потенциально чувствительными к нагрузке раннера.
+- Telegram и Paperclip в тестах заменены mock-серверами по документации и коду Paperclip. Живой Paperclip с board-ключом и живой Telegram в набор не входят.
+- Нет автотеста на ключи разных пользователей и на пропуск компании по `403`/`404` (см. таблицу клиента Paperclip).
 - Контейнерный smoke-test не поднимает mock-серверы; см. строки «слабо» выше.

@@ -33,9 +33,8 @@ printf '%s' '<board key>'  > /tmp/bridge-dev/pc
 
 export PAPERCLIP_URL=http://127.0.0.1:3100
 export PAPERCLIP_TOKEN_FILE=/tmp/bridge-dev/pc
-export PAPERCLIP_COMPANY_IDS=<id компании>
 export TELEGRAM_BOT_TOKEN_FILE=/tmp/bridge-dev/tg
-export TELEGRAM_CHAT_ID=<id чата> TELEGRAM_USER_ID=<id пользователя>
+export TELEGRAM_CHAT_ID=<id супергруппы с темами, -100…> TELEGRAM_ALLOWED_USER_IDS=<id пользователя>
 export TELEGRAM_PROXY_URL=socks5h://127.0.0.1:1080
 export STATE_PATH=/tmp/bridge-dev/bridge.db HEALTH_FILE=/tmp/bridge-dev/health.json
 export LOG_FORMAT=text LOG_LEVEL=debug       # RUST_LOG не читается
@@ -44,6 +43,8 @@ cargo run -- check-config     # проверка без сети
 cargo run -- run
 ```
 
+Компании и беседы bridge находит сам; `PAPERCLIP_COMPANY_IDS` и `TELEGRAM_USER_ID` (v1) задавать нельзя, `check-config` завершится с кодом 2. Для запуска `run` нужны приватная супергруппа с темами и бот-администратор с правом «Управление темами» ([README](../README.md), «Настройка супергруппы»). Несколько ключей одного пользователя — `PAPERCLIP_TOKEN_FILES` вместо `PAPERCLIP_TOKEN_FILE`.
+
 Значения по умолчанию для `STATE_PATH` и `HEALTH_FILE` (`/state/...`) на хосте недоступны для записи, поэтому переопределите их, как выше. Proxy обязателен и при локальном запуске: без него процесс не стартует. Не используйте реальные секреты в файлах репозитория и не коммитьте их.
 
 ## Структура
@@ -51,23 +52,24 @@ cargo run -- run
 ```
 src/
   main.rs           подкоманды run / check-config / healthcheck / revoke-paperclip-key, коды выхода
-  app.rs            сборка сервиса, запуск задач, остановка
-  config.rs         переменные окружения, SecretString, ProxyUrl
+  app.rs            сборка сервиса, запуск задач, остановка, health_writer
+  config.rs         переменные окружения, SecretString, ProxyUrl, переменные v1
   health.rs         heartbeat-файл и его проверка
   shutdown.rs       SIGTERM/SIGINT -> CancellationToken
   retry.rs          backoff с jitter
   fault.rs          точки отказа для тестов (feature fault-injection)
   logging.rs        tracing, хеш ID, провайдер TLS
   timeutil.rs       время и форматирование
-  domain/           типы карточек, черновиков, задач, runs (каталог)
-  paperclip/        PaperclipApi (trait), DTO, HttpPaperclipClient
-  telegram/         TelegramApi (trait), типы Bot API, HttpTelegramClient
-  render/           карточки в HTML, клавиатуры, callback_data (каталог)
-  store/            Store и SQL (sqlite.rs)
-  core/             poller, dialog, sync, runs, outbox, sender, governed, forms, commands, allowlist, cards
+  domain/           компания, беседа, комментарий; правило пересылки и служебных сообщений (comment.rs)
+  paperclip/        PaperclipApi (trait), DTO (dto.rs), HttpPaperclipClient, проверка версии (version.rs)
+  telegram/         TelegramApi (trait), типы Bot API, HttpTelegramClient, классификация ошибок
+  render/           Markdown -> Telegram HTML (markdown.rs), нарезка (text.rs), названия тем и тексты сообщений bridge (mod.rs)
+  store/            Store и SQL (sqlite.rs), миграции
+  core/             discovery (компании, беседы), outbound (Paperclip -> Telegram), sender и topics (очередь Telegram, темы),
+                    poller и inbound (Telegram -> очередь), outbox (pc_outbox -> Paperclip), allowlist, checks (проверка группы)
 tests/              интеграционные тесты; tests/support — общая обвязка (mock Paperclip на wiremock, fake Telegram, proxy)
-scripts/            docker-smoke.sh, check-testing-refs.sh
-deploy/             compose.example.yml (пример)
+scripts/            docker-smoke.sh, compose-*.sh, secrets-rootless-test.sh, gitignore-check-test.sh, check-testing-refs.sh
+deploy/             compose.example.yml, compose.host-network.example.yml (примеры)
 docs/               документация, adr/
 ```
 
@@ -83,10 +85,10 @@ docs/               документация, adr/
 |---|---|
 | Новая переменная окружения | `src/config.rs` (разбор, значение по умолчанию, тест в том же файле), `.env.example`, таблица в `README.md` |
 | Новый вызов Paperclip | метод в `PaperclipApi` (`src/paperclip/mod.rs`), реализация в `http.rs`, DTO в `dto.rs`, тест в `tests/paperclip_contract.rs`, строка в `docs/PAPERCLIP_PERMISSIONS.md` |
-| Изменение схемы БД | новая запись в `MIGRATIONS` и `SCHEMA_VERSION` в `src/store/sqlite.rs`; существующие миграции не редактировать |
-| Новое поведение карточек | `src/render/` и `src/core/`, тест в `tests/core_flow.rs`, `forms_flow.rs` или `governed.rs` |
+| Изменение схемы БД | новая запись в `MIGRATIONS` и `SCHEMA_VERSION` (сейчас `2`) в `src/store/sqlite.rs`; существующие миграции не редактировать; тест в `tests/store.rs`, описание в ARCHITECTURE §3 и BACKUP_RESTORE. Миграция 1 — схема v1, миграция 2 удаляет её таблицы и сохраняет только `meta.telegram_offset` |
+| Новое поведение пересылки (фильтр комментариев, служебные сообщения, темы, очереди) | `src/domain/comment.rs`, `src/core/`, `src/render/`; тест в `tests/flow.rs`, `tests/gaps.rs`, `tests/notices.rs` или `tests/rule.rs`; при изменении фильтра — `docs/paperclip-api.md` §6.1 и ARCHITECTURE §4.3 |
 | Изменение таблицы покрытия | `docs/TESTING.md`; `bash scripts/check-testing-refs.sh` проверяет, что каждая ссылка «файл::тест» существует |
 
 ## Правила репозитория
 
-Вся работа ведётся в ветке `feat/bridge-v1` и одном PR; прямые push в `main` запрещены, merge делает только PET Lead. В коммитах и документах нет секретов, реальных адресов и имён инфраструктуры — только плейсхолдеры (`paperclip.internal`, `xray`, `123456789`).
+Работа ведётся в ветках и PR (по шаблону репозитория); прямые push в `main` запрещены, на `main` включена branch protection, merge делает только PET Lead. В коммитах и документах нет секретов, реальных адресов и имён инфраструктуры — только плейсхолдеры (`paperclip.internal`, `xray`, `123456789`).
